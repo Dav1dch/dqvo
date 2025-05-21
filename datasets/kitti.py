@@ -1,15 +1,17 @@
 import glob
 import os
-import pdb
+import pickle
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import tqdm
 from PIL import Image
 from torchvision import transforms
 
-from datasets.utils import rotation_to_euler
+from datasets.utils import extract_fp, rotation_to_euler
 
 
 class KITTI(torch.utils.data.Dataset):
@@ -72,6 +74,30 @@ class KITTI(torch.utils.data.Dataset):
 
         self.data = data
         self.windowed_data = self.create_windowed_dataframe(data)
+        self.generate_fp()
+
+    def generate_fp(self):
+        id_dict = {}
+        for i in tqdm.tqdm(self.windowed_data["w_idx"].unique()):
+            fp_dict = {}
+            data = self.windowed_data.loc[self.windowed_data["w_idx"] == i]
+            frame = data["frames"].values
+            cvimage1 = cv2.imread(frame[0], cv2.IMREAD_GRAYSCALE)
+            cvimage2 = cv2.imread(frame[1], cv2.IMREAD_GRAYSCALE)
+            pt1, pt2 = extract_fp(cvimage1, cvimage2)
+            fp_dict["pt1"] = pt1
+            fp_dict["pt2"] = pt2
+            id_dict[i] = fp_dict
+        with open("fp.pickle", "wb") as p:
+            pickle.dump(id_dict, p, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # for fname in frames:
+        #     img = Image.open(fname).convert("RGB")
+        #     # pre processing
+        #     img = self.transform(img)
+        #     img = img.unsqueeze(0)
+        #     imgs.append(img)
+        #     continue
 
     def __len__(self):
         return len(self.windowed_data["w_idx"].unique())

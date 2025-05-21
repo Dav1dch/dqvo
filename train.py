@@ -201,8 +201,8 @@ if __name__ == "__main__":
         "data_dir": "data",
         "bsize": 4,  # batch size
         "val_split": 0.1,  # percentage to use as validation data
-        "window_size": 8,  # number of frames in window
-        "overlap": 4,  # number of frames overlapped between windows
+        "window_size": 2,  # number of frames in window
+        "overlap": 1,  # number of frames overlapped between windows
         "optimizer": "Adam",  # optimizer [Adam, SGD, Adagrad, RAdam]
         "lr": 1e-5,  # learning rate
         "momentum": 0.9,  # SGD momentum
@@ -210,7 +210,7 @@ if __name__ == "__main__":
         "epoch": 300,  # train iters each timestep
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
-        "checkpoint_path": "checkpoints/Exp18",  # path to save checkpoint
+        "checkpoint_path": "checkpoints/Exp19",  # path to save checkpoint
         "checkpoint": "checkpoint_best.pth",  # checkpoint
         # "checkpoint": None,  # checkpoint
     }

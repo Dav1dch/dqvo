@@ -1,10 +1,34 @@
-import numpy as np
-import torch
 import functools
 
+import cv2
+import numpy as np
+import torch
 
-def rotation_to_euler(M, cy_thresh=None, seq='zyx'):
-    '''
+
+def extract_fp(cvimage1, cvimage2):
+    orb = cv2.ORB_create()
+
+    k1, d1 = orb.detectAndCompute(cvimage1, None)
+    k2, d2 = orb.detectAndCompute(cvimage2, None)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    matches = bf.match(d1, d2)
+
+    matches = sorted(matches, key=lambda x: x.distance)
+
+    pt1 = []
+    pt2 = []
+
+    for m in matches[:50]:
+        pt1.append([list(map(round, list(k1[m.queryIdx].pt)))])
+        pt2.append([list(map(round, list(k2[m.trainIdx].pt)))])
+    pt1 = torch.Tensor(pt1).float().squeeze(1)
+    pt2 = torch.Tensor(pt2).float().squeeze(1)
+    return pt1, pt2
+
+
+def rotation_to_euler(M, cy_thresh=None, seq="zyx"):
+    """
     Taken From: http://afni.nimh.nih.gov/pub/dist/src/pkundu/meica.libs/nibabel/eulerangles.py
     Discover Euler angle vector from 3x3 matrix
     Uses the conventions above.
@@ -47,7 +71,7 @@ def rotation_to_euler(M, cy_thresh=None, seq='zyx'):
     See: http://www.graphicsgems.org/
     The code appears to be licensed (from the website) as "can be used
     without restrictions".
-    '''
+    """
     M = np.asarray(M)
     if cy_thresh is None:
         try:
@@ -57,7 +81,7 @@ def rotation_to_euler(M, cy_thresh=None, seq='zyx'):
     r11, r12, r13, r21, r22, r23, r31, r32, r33 = M.flat
     # cy: sqrt((cos(y)*cos(z))**2 + (cos(x)*cos(y))**2)
     cy = np.sqrt(r33 * r33 + r23 * r23)
-    if seq == 'zyx':
+    if seq == "zyx":
         if cy > cy_thresh:  # cos(y) not close to zero, standard form
             z = np.arctan2(-r12, r11)  # atan2(cos(y)*sin(z), cos(y)*cos(z))
             y = np.arctan2(r13, cy)  # atan2(sin(y), cy)
@@ -67,7 +91,7 @@ def rotation_to_euler(M, cy_thresh=None, seq='zyx'):
             z = np.arctan2(r21, r22)
             y = np.arctan2(r13, cy)  # atan2(sin(y), cy)
             x = 0.0
-    elif seq == 'xyz':
+    elif seq == "xyz":
         if cy > cy_thresh:
             y = np.arctan2(-r31, cy)
             x = np.arctan2(r32, r33)
@@ -80,12 +104,12 @@ def rotation_to_euler(M, cy_thresh=None, seq='zyx'):
             else:
                 y = -np.pi / 2
     else:
-        raise Exception('Sequence not recognized')
+        raise Exception("Sequence not recognized")
     return [z, y, x]
 
 
-def euler_to_rotation(z=0, y=0, x=0, isRadian=True, seq='zyx'):
-    ''' Return matrix for rotations around z, y and x axes
+def euler_to_rotation(z=0, y=0, x=0, isRadian=True, seq="zyx"):
+    """Return matrix for rotations around z, y and x axes
     Uses the z, then y, then x convention above
     Parameters
     ----------
@@ -143,15 +167,15 @@ def euler_to_rotation(z=0, y=0, x=0, isRadian=True, seq='zyx'):
     curl your fingers; the direction your fingers curl is the direction
     of rotation).  Therefore, the rotations are counterclockwise if
     looking along the axis of rotation from positive to negative.
-    '''
+    """
 
-    if seq != 'xyz' and seq != 'zyx':
-        raise Exception('Sequence not recognized')
+    if seq != "xyz" and seq != "zyx":
+        raise Exception("Sequence not recognized")
 
     if not isRadian:
-        z = ((np.pi) / 180.) * z
-        y = ((np.pi) / 180.) * y
-        x = ((np.pi) / 180.) * x
+        z = ((np.pi) / 180.0) * z
+        y = ((np.pi) / 180.0) * y
+        x = ((np.pi) / 180.0) * x
     if z < -np.pi:
         while z < -np.pi:
             z += 2 * np.pi
@@ -170,69 +194,52 @@ def euler_to_rotation(z=0, y=0, x=0, isRadian=True, seq='zyx'):
     if x > np.pi:
         while x > np.pi:
             x -= 2 * np.pi
-    assert z >= (-np.pi) and z < np.pi, 'Inappropriate z: %f' % z
-    assert y >= (-np.pi) and y < np.pi, 'Inappropriate y: %f' % y
-    assert x >= (-np.pi) and x < np.pi, 'Inappropriate x: %f' % x
+    assert z >= (-np.pi) and z < np.pi, "Inappropriate z: %f" % z
+    assert y >= (-np.pi) and y < np.pi, "Inappropriate y: %f" % y
+    assert x >= (-np.pi) and x < np.pi, "Inappropriate x: %f" % x
 
     Ms = []
 
-    if seq == 'zyx':
+    if seq == "zyx":
 
         if z:
             cosz = np.cos(z)
             sinz = np.sin(z)
-            Ms.append(np.array(
-                [[cosz, -sinz, 0],
-                 [sinz, cosz, 0],
-                 [0, 0, 1]]))
+            Ms.append(np.array([[cosz, -sinz, 0], [sinz, cosz, 0], [0, 0, 1]]))
         if y:
             cosy = np.cos(y)
             siny = np.sin(y)
-            Ms.append(np.array(
-                [[cosy, 0, siny],
-                 [0, 1, 0],
-                 [-siny, 0, cosy]]))
+            Ms.append(np.array([[cosy, 0, siny], [0, 1, 0], [-siny, 0, cosy]]))
         if x:
             cosx = np.cos(x)
             sinx = np.sin(x)
-            Ms.append(np.array(
-                [[1, 0, 0],
-                 [0, cosx, -sinx],
-                 [0, sinx, cosx]]))
+            Ms.append(np.array([[1, 0, 0], [0, cosx, -sinx], [0, sinx, cosx]]))
         if Ms:
             return functools.reduce(np.dot, Ms[::-1])
         return np.eye(3)
 
-    elif seq == 'xyz':
+    elif seq == "xyz":
 
         if x:
             cosx = np.cos(x)
             sinx = np.sin(x)
-            Ms.append(np.array(
-                [[1, 0, 0],
-                 [0, cosx, -sinx],
-                 [0, sinx, cosx]]))
+            Ms.append(np.array([[1, 0, 0], [0, cosx, -sinx], [0, sinx, cosx]]))
         if y:
             cosy = np.cos(y)
             siny = np.sin(y)
-            Ms.append(np.array(
-                [[cosy, 0, siny],
-                 [0, 1, 0],
-                 [-siny, 0, cosy]]))
+            Ms.append(np.array([[cosy, 0, siny], [0, 1, 0], [-siny, 0, cosy]]))
         if z:
             cosz = np.cos(z)
             sinz = np.sin(z)
-            Ms.append(np.array(
-                [[cosz, -sinz, 0],
-                 [sinz, cosz, 0],
-                 [0, 0, 1]]))
+            Ms.append(np.array([[cosz, -sinz, 0], [sinz, cosz, 0], [0, 0, 1]]))
 
         if Ms:
             return functools.reduce(np.dot, Ms[::-1])
         return np.eye(3)
 
-def euler_to_rotation_torch(xyz, isRadian=True, seq='zyx'):
-    ''' Return matrix for rotations around z, y and x axes
+
+def euler_to_rotation_torch(xyz, isRadian=True, seq="zyx"):
+    """Return matrix for rotations around z, y and x axes
     Uses the z, then y, then x convention above
     Parameters
     ----------
@@ -290,16 +297,16 @@ def euler_to_rotation_torch(xyz, isRadian=True, seq='zyx'):
     curl your fingers; the direction your fingers curl is the direction
     of rotation).  Therefore, the rotations are counterclockwise if
     looking along the axis of rotation from positive to negative.
-    '''
+    """
 
     z, y, x = xyz
-    if seq != 'xyz' and seq != 'zyx':
-        raise Exception('Sequence not recognized')
+    if seq != "xyz" and seq != "zyx":
+        raise Exception("Sequence not recognized")
 
     if not isRadian:
-        z = ((torch.pi) / 180.) * z
-        y = ((torch.pi) / 180.) * y
-        x = ((torch.pi) / 180.) * x
+        z = ((torch.pi) / 180.0) * z
+        y = ((torch.pi) / 180.0) * y
+        x = ((torch.pi) / 180.0) * x
     if z < -torch.pi:
         while z < -torch.pi:
             z += 2 * torch.pi
@@ -318,62 +325,46 @@ def euler_to_rotation_torch(xyz, isRadian=True, seq='zyx'):
     if x > torch.pi:
         while x > torch.pi:
             x -= 2 * torch.pi
-    assert z >= (-torch.pi) and z < torch.pi, 'Inappropriate z: %f' % z
-    assert y >= (-torch.pi) and y < torch.pi, 'Inappropriate y: %f' % y
-    assert x >= (-torch.pi) and x < torch.pi, 'Inappropriate x: %f' % x
+    assert z >= (-torch.pi) and z < torch.pi, "Inappropriate z: %f" % z
+    assert y >= (-torch.pi) and y < torch.pi, "Inappropriate y: %f" % y
+    assert x >= (-torch.pi) and x < torch.pi, "Inappropriate x: %f" % x
 
     Ms = []
 
-    if seq == 'zyx':
+    if seq == "zyx":
 
         if z:
             cosz = torch.cos(z)
             sinz = torch.sin(z)
-            Ms.append(torch.Tensor(
-                [[cosz, -sinz, 0.],
-                    [sinz, cosz, 0.],
-                    [0., 0., 1.]]))
+            Ms.append(
+                torch.Tensor([[cosz, -sinz, 0.0], [sinz, cosz, 0.0], [0.0, 0.0, 1.0]])
+            )
         if y:
             cosy = torch.cos(y)
             siny = torch.sin(y)
-            Ms.append(torch.Tensor(
-                [[cosy, 0, siny],
-                    [0, 1, 0],
-                    [-siny, 0, cosy]]))
+            Ms.append(torch.Tensor([[cosy, 0, siny], [0, 1, 0], [-siny, 0, cosy]]))
         if x:
             cosx = torch.cos(x)
             sinx = torch.sin(x)
-            Ms.append(torch.Tensor(
-                [[1, 0, 0],
-                    [0, cosx, -sinx],
-                    [0, sinx, cosx]]))
+            Ms.append(torch.Tensor([[1, 0, 0], [0, cosx, -sinx], [0, sinx, cosx]]))
         if Ms:
             return functools.reduce(torch.matmul, Ms[::-1])
         return torch.eye(3)
 
-    elif seq == 'xyz':
+    elif seq == "xyz":
 
         if x:
             cosx = torch.cos(x)
             sinx = torch.sin(x)
-            Ms.append(torch.Tensor(
-                [[1, 0, 0],
-                 [0, cosx, -sinx],
-                 [0, sinx, cosx]]))
+            Ms.append(torch.Tensor([[1, 0, 0], [0, cosx, -sinx], [0, sinx, cosx]]))
         if y:
             cosy = torch.cos(y)
             siny = torch.sin(y)
-            Ms.append(torch.Tensor(
-                [[cosy, 0, siny],
-                 [0, 1, 0],
-                 [-siny, 0, cosy]]))
+            Ms.append(torch.Tensor([[cosy, 0, siny], [0, 1, 0], [-siny, 0, cosy]]))
         if z:
             cosz = torch.cos(z)
             sinz = torch.sin(z)
-            Ms.append(torch.Tensor(
-                [[cosz, -sinz, 0],
-                 [sinz, cosz, 0],
-                 [0, 0, 1]]))
+            Ms.append(torch.Tensor([[cosz, -sinz, 0], [sinz, cosz, 0], [0, 0, 1]]))
 
         if Ms:
             return functools.reduce(torch.dot, Ms[::-1])
