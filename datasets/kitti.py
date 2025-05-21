@@ -74,7 +74,11 @@ class KITTI(torch.utils.data.Dataset):
 
         self.data = data
         self.windowed_data = self.create_windowed_dataframe(data)
-        self.generate_fp()
+        if not os.path.exists("fp.pickle"):
+            self.generate_fp()
+        self.fp = None
+        with open("fp.pickle", "rb") as p:
+            self.fp = pickle.load(p)
 
     def generate_fp(self):
         id_dict = {}
@@ -90,14 +94,6 @@ class KITTI(torch.utils.data.Dataset):
             id_dict[i] = fp_dict
         with open("fp.pickle", "wb") as p:
             pickle.dump(id_dict, p, protocol=pickle.HIGHEST_PROTOCOL)
-
-        # for fname in frames:
-        #     img = Image.open(fname).convert("RGB")
-        #     # pre processing
-        #     img = self.transform(img)
-        #     img = img.unsqueeze(0)
-        #     imgs.append(img)
-        #     continue
 
     def __len__(self):
         return len(self.windowed_data["w_idx"].unique())

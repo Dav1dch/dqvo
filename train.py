@@ -211,8 +211,8 @@ if __name__ == "__main__":
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
         "checkpoint_path": "checkpoints/Exp19",  # path to save checkpoint
-        "checkpoint": "checkpoint_best.pth",  # checkpoint
-        # "checkpoint": None,  # checkpoint
+        # "checkpoint": "checkpoint_best.pth",  # checkpoint
+        "checkpoint": None,  # checkpoint
     }
 
     # tiny  - patch_size=16, embed_dim=192, depth=12, num_heads=3
