@@ -161,9 +161,7 @@ if __name__ == "__main__":
             sequence
         )
         pred_poses = np.load(pred_path)
-        pred_TS_poses = np.load(pred_TS_path)[:-2]
-        print(len(pred_poses))
-        print(len(pred_TS_poses))
+        pred_TS_poses = np.load(pred_TS_path)
 
         # post processing and recover trajectory
         poses = post_processing(pred_poses, args)

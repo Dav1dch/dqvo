@@ -65,13 +65,6 @@ class KITTI(torch.utils.data.Dataset):
         data = data["gt"].apply(pd.Series)
         data["frames"] = frames
         data["sequence"] = seqs
-        self.gray_transform = transforms.Compose(
-            [
-                transforms.Resize((192, 640)),
-                transforms.ToTensor(),
-            ]
-        )
-
         self.data = data
         self.windowed_data = self.create_windowed_dataframe(data)
         if not os.path.exists("fp.pickle"):
@@ -108,10 +101,13 @@ class KITTI(torch.utils.data.Dataset):
         # get data of corresponding window index
         data = self.windowed_data.loc[self.windowed_data["w_idx"] == idx, :]
 
+        fp = self.fp[idx]
+        pt1 = fp["pt1"]
+        pt2 = fp["pt2"]
+
         # Read frames as grayscale
         frames = data["frames"].values
         imgs = []
-        gray_imgs = []
         for fname in frames:
             img = Image.open(fname).convert("RGB")
             # pre processing
@@ -163,7 +159,7 @@ class KITTI(torch.utils.data.Dataset):
         # y = y.flatten()
         global_pose = np.asarray(global_pose)
 
-        return imgs, y
+        return imgs, pt1, pt2, y
 
     def read_intrinsics_param(self):
         """
