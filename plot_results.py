@@ -9,6 +9,10 @@ import numpy as np
 from datasets.kitti import KITTI
 from datasets.utils import euler_to_rotation
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 
 def save_trajectory(poses, sequence, save_dir):
     """
@@ -95,7 +99,7 @@ def post_processing(pred_poses, args):
     return np.asarray(poses)
 
 
-def recover_trajectory_and_poses(poses):
+def recover_trajectory_and_poses(poses, norm):
 
     predicted_poses = []
     # recover predicted trajectory
@@ -114,8 +118,9 @@ def recover_trajectory_and_poses(poses):
         std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
         [x, y, z] = angles
 
-        [x, y, z] = np.multiply(angles, std_angles) + mean_angles
-        t = np.multiply(t, std_t) + mean_t
+        if norm:
+            [x, y, z] = np.multiply(angles, std_angles) + mean_angles
+            t = np.multiply(t, std_t) + mean_t
         R = np.asarray(euler_to_rotation(x, y, z, seq="zyx"))
 
         T_r = np.concatenate(
@@ -136,10 +141,12 @@ def recover_trajectory_and_poses(poses):
 
 if __name__ == "__main__":
 
-    ckpt_path = "checkpoints/Exp18/"
+    ckpt_path = "checkpoints/Exp22/"
     ckpt_name = "checkpoint_best"
     sequences = ["01", "03", "04", "05", "06", "07", "10"]
     # sequences = ['00',"01",'02', "03", "04", "05", "06", "07", '08', '09',"10"]
+    # sequences = ["03", "07"]
+    # sequences = ["07"]
 
     # read hyperparameters and configuration
     with open(os.path.join(ckpt_path, "args.pkl"), "rb") as f:
@@ -157,17 +164,17 @@ if __name__ == "__main__":
         pred_path = os.path.join(
             args["checkpoint_path"], "pred_poses_{}.npy".format(sequence)
         )
-        pred_TS_path = "/home/david/Codes/OTSformer-fp/checkpoints/TS/checkpoint_best/pred_poses_{}.npy".format(
-            sequence
-        )
+        # pred_TS_path = "/home/david/Codes/OTSformer-fp/checkpoints/TS/checkpoint_best/pred_poses_{}.npy".format(
+        #     sequence
+        # )
         pred_poses = np.load(pred_path)
-        pred_TS_poses = np.load(pred_TS_path)
+        # pred_TS_poses = np.load(pred_TS_path)
 
         # post processing and recover trajectory
         poses = post_processing(pred_poses, args)
-        poses_TS = post_processing(pred_TS_poses, args)
-        pred_poses, pred_trajectory = recover_trajectory_and_poses(poses)
-        pred_TS_poses, pred_TS_trajectory = recover_trajectory_and_poses(poses_TS)
+        # poses_TS = post_processing(pred_TS_poses, args)
+        pred_poses, pred_trajectory = recover_trajectory_and_poses(poses, True)
+        # pred_TS_poses, pred_TS_trajectory = recover_trajectory_and_poses(poses_TS, True)
 
         save_trajectory(
             pred_poses,
@@ -186,9 +193,9 @@ if __name__ == "__main__":
         plt.plot(
             [x[0] for x in pred_trajectory], [z[2] for z in pred_trajectory], "b"
         )  # plot estimated trajectory
-        plt.plot(
-            [x[0] for x in pred_TS_trajectory], [z[2] for z in pred_TS_trajectory], "g"
-        )  # plot ground truth trajectory
+        # plt.plot(
+        #     [x[0] for x in pred_TS_trajectory], [z[2] for z in pred_TS_trajectory], "g"
+        # )  # plot ground truth trajectory
         plt.plot(
             [x[0] for x in gt_poses.values], [z[2] for z in gt_poses.values], "r"
         )  # plot ground truth trajectory

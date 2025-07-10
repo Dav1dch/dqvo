@@ -1,6 +1,7 @@
 from pickletools import optimize
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
@@ -156,8 +157,30 @@ def extract_fp(cvimage1, cvimage2):
     return pt1, pt2
 
 
+def denormailzation(angles, t, normalizations):
+    angles = (
+        torch.multiply(angles, normalizations["mean_angles"])
+        + normalizations["std_angles"]
+    )
+    t = torch.multiply(t, normalizations["mean_t"]) + normalizations["std_t"]
+    return angles, t
+
+
 def main():
     global K, gt_pose
+    normalizations = {}
+    # self.mean_angles = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    # self.std_angles = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    # self.mean_t = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    # self.std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
+    normalizations["mean_angles"] = torch.Tensor(
+        [1.7061e-5, 9.5582e-4, -5.5258e-5]
+    ).cuda()
+    normalizations["std_angles"] = torch.Tensor(
+        [2.8256e-3, 1.7771e-2, 3.2326e-3]
+    ).cuda()
+    normalizations["mean_t"] = torch.Tensor([-8.6736e-5, -1.6038e-2, 9.0033e-1]).cuda()
+    normalizations["std_t"] = torch.Tensor([2.5584e-2, 1.8545e-2, 3.0352e-1]).cuda()
     args = {
         "data_dir": "data",
         "bsize": 4,  # batch size
@@ -172,8 +195,8 @@ def main():
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
         "checkpoint_path": "checkpoints/Exp18",  # path to save checkpoint
-        "checkpoint": "checkpoint_best.pth",  # checkpoint
-        # "checkpoint": None,  # checkpoint
+        # "checkpoint": "checkpoint_best.pth",  # checkpoint
+        "checkpoint": None,  # checkpoint
     }
 
     # tiny  - patch_size=16, embed_dim=192, depth=12, num_heads=3
@@ -254,13 +277,30 @@ def main():
     ones = torch.ones((pt1.shape[0], 1)).cuda()
     pt1 = torch.hstack((pt1, ones)).unsqueeze(-1)
     pt2 = torch.hstack((pt2, ones)).unsqueeze(1)
-    gt_pose = gt_pose.unsqueeze(0)
+    mean_angles = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    std_angles = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    mean_t = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
 
-    for i in range(100):
+    gt_pose = gt_pose.unsqueeze(0)
+    # gt_pose = gt_pose.unsqueeze(0).cpu().numpy()
+    # print(gt_pose)
+    # angles = gt_pose[:, :3].squeeze(0)
+    # t = gt_pose[:, 3:].squeeze(0)
+    # angles = (np.asarray(angles) - mean_angles) / std_angles
+    # t = (np.asarray(t) - mean_t) / std_t
+    # gt_pose = torch.Tensor(angles.tolist() + t.tolist()).cuda()
+    # print(gt_pose)
+
+    losses = []
+
+    for i in range(300):
         output = model(input_images).squeeze(0)
         loss1 = criterion(output, gt_pose)
         t = output[:, 3:]
         angles = output[:, :3]
+
+        # angles, t = denormailzation(angles, t, normalizations)
         R = euler_to_rotation_matrix(angles).squeeze()
         t_x = torch.Tensor(
             [[0, -t[0][2], t[0][1]], [t[0][2], 0, -t[0][0]], [-t[0][1], t[0][0], 0]]
@@ -269,11 +309,12 @@ def main():
         term = torch.bmm(pt2, E.unsqueeze(0).expand(50, 3, 3))
         result = torch.bmm(term, pt1)
         loss2 = result.abs().mean()
-        loss = loss1 + loss2
+        losses.append(loss1.item())
+        print(loss2)
+        loss = loss2
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        print(loss2)
 
     E = torch.mm(t_x, R)
     term = torch.bmm(pt2, E.unsqueeze(0).expand(50, 3, 3))
@@ -282,6 +323,11 @@ def main():
     print(mean_error)
     # groundtruth
     # 9.999978e-01 5.272628e-04 -2.066935e-03 -4.690294e-02 -5.296506e-04 9.999992e-01 -1.154865e-03 -2.839928e-02 2.066324e-03 1.155958e-03 9.999971e-01 8.586941e-01
+
+    x = np.arange(0, len(losses))
+    plt.figure(figsize=(10, 6))
+    plt.plot(x, losses)
+    plt.show()
 
     # intrinsic
     # P2: 7.188560000000e+02 0.000000000000e+00 6.071928000000e+02

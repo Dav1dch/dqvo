@@ -14,6 +14,12 @@ from torchvision import transforms
 from datasets.utils import extract_fp, rotation_to_euler
 
 
+def pixel2cam(pt, fx, fy, cx, cy):
+    pt[:, 0] = (pt[:, 0] - cx) / fx
+    pt[:, 1] = (pt[:, 1] - cy) / fy
+    return pt
+
+
 class KITTI(torch.utils.data.Dataset):
     """
     Dataloader for KITTI Visual Odometry Dataset
@@ -30,6 +36,7 @@ class KITTI(torch.utils.data.Dataset):
         gt_path=r"data/poses",
         camera_id="2",
         sequences=["00", "02", "08", "09"],
+        # sequences=["00"],
         window_size=3,
         overlap=1,
         read_poses=True,
@@ -59,6 +66,7 @@ class KITTI(torch.utils.data.Dataset):
         # read frames list and ground truths
         frames, seqs = self.read_frames()
         gt = self.read_gt()
+        self.cam_params = {}
 
         # create dataframe with frames and ground truths
         data = pd.DataFrame({"gt": gt})
@@ -66,6 +74,8 @@ class KITTI(torch.utils.data.Dataset):
         data["frames"] = frames
         data["sequence"] = seqs
         self.data = data
+        self.read_intrinsics_param()
+        print(self.cam_params)
         self.windowed_data = self.create_windowed_dataframe(data)
         if not os.path.exists("fp.pickle"):
             self.generate_fp()
@@ -82,6 +92,20 @@ class KITTI(torch.utils.data.Dataset):
             cvimage1 = cv2.imread(frame[0], cv2.IMREAD_GRAYSCALE)
             cvimage2 = cv2.imread(frame[1], cv2.IMREAD_GRAYSCALE)
             pt1, pt2 = extract_fp(cvimage1, cvimage2)
+            pt1 = pixel2cam(
+                pt1,
+                self.cam_params["fx"],
+                self.cam_params["fy"],
+                self.cam_params["cx"],
+                self.cam_params["cy"],
+            )
+            pt2 = pixel2cam(
+                pt2,
+                self.cam_params["fx"],
+                self.cam_params["fy"],
+                self.cam_params["cx"],
+                self.cam_params["cy"],
+            )
             fp_dict["pt1"] = pt1
             fp_dict["pt2"] = pt2
             id_dict[i] = fp_dict
@@ -101,9 +125,9 @@ class KITTI(torch.utils.data.Dataset):
         # get data of corresponding window index
         data = self.windowed_data.loc[self.windowed_data["w_idx"] == idx, :]
 
-        fp = self.fp[idx]
-        pt1 = fp["pt1"]
-        pt2 = fp["pt2"]
+        # fp = self.fp[idx]
+        # pt1 = fp["pt1"]
+        # pt2 = fp["pt2"]
 
         # Read frames as grayscale
         frames = data["frames"].values
@@ -159,6 +183,9 @@ class KITTI(torch.utils.data.Dataset):
         # y = y.flatten()
         global_pose = np.asarray(global_pose)
 
+        pt1 = torch.Tensor([])
+        pt2 = torch.Tensor([])
+
         return imgs, pt1, pt2, y
 
     def read_intrinsics_param(self):
@@ -168,7 +195,8 @@ class KITTI(torch.utils.data.Dataset):
         Returns:
             cam_params {dict}: dictionary with focal lenght and principal point
         """
-        calib_file = os.path.join(self.data_path, self.sequence, "calib.txt")
+        # calib_file = os.path.join(self.data_path, self.sequence, "calib.txt")
+        calib_file = os.path.join(self.data_path, "00", "calib.txt")
         with open(calib_file, "r") as f:
             lines = f.readlines()
             line = lines[int(self.camera_id)].strip().split()

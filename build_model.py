@@ -1,14 +1,16 @@
-import torch
-import numpy as np
 import os
+from functools import partial
+
+import numpy as np
+import torch
 import torch.nn as nn
+from einops import rearrange, reduce, repeat
+
+from timesformer.models.helpers import load_pretrained
 
 # from timesformer.models.vit import CrossViT, VisionTransformer
 from timesformer.models.vit_seq import CrossViT
-from functools import partial
-from einops import rearrange, reduce, repeat
-from timesformer.models.helpers import load_pretrained
-
+from timesformer.models.mamba import CrossVisionMamba
 
 default_cfgs = {
     "vit_patch16_edim768": {
@@ -66,15 +68,34 @@ def build_model(args, model_params):
     #                           drop_path_rate=model_params["ff_dropout"],
     #                           num_frames=model_params["num_frames"],
     #                           attention_type=model_params["attention_type"])
-    model = CrossViT(
+    # model = CrossViT(
+    #     image_height=model_params["image_size"][0],
+    #     image_width=model_params["image_size"][1],
+    #     patch_size=model_params["patch_size"],
+    #     num_classes=256,
+    #     dim=model_params["dim"],
+    #     depth=model_params["depth"],
+    #     heads=model_params["heads"],
+    #     mlp_dim=1024,
+    # )
+    model = CrossVisionMamba(
         image_height=model_params["image_size"][0],
         image_width=model_params["image_size"][1],
         patch_size=model_params["patch_size"],
-        num_classes=256,
-        dim=model_params["dim"],
-        depth=model_params["depth"],
-        heads=model_params["heads"],
-        mlp_dim=1024,
+        num_classes=1000,
+        # patch_size=16,
+        embed_dim=192,
+        depth=16,
+        rms_norm=True,
+        residual_in_fp32=True,
+        fused_add_norm=True,
+        final_pool_type="mean",
+        if_abs_pos_embed=True,
+        if_rope=False,
+        if_rope_residual=False,
+        bimamba_type="V2",
+        if_cls_token=False,
+        use_double_cls_token=False,
     )
 
     if model_params["time_only"]:
@@ -89,7 +110,7 @@ def build_model(args, model_params):
     args["best_val"] = np.inf
     if args["checkpoint"] is not None:
         checkpoint = torch.load(
-            os.path.join(args["checkpoint_path"], args["checkpoint"])
+            os.path.join(args["checkpoint_path"], args["checkpoint"]), weights_only=True
         )
         args["epoch_init"] = checkpoint["epoch"] + 1
         args["best_val"] = checkpoint["best_val"]

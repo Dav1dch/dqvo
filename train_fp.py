@@ -13,17 +13,92 @@ from build_model import build_model
 from datasets.kitti import KITTI
 from datasets.utils import euler_to_rotation_torch
 
-# from tensorboard import program
+from tensorboard import program
 
 
 torch.manual_seed(2023)
 
 
+def vector_to_skew_symmetric(v):
+    """
+    将 (B, 3) 的向量转换为 (B, 3, 3) 的反对称矩阵
+    """
+    B = v.shape[0]
+    # 提取分量
+    v1, v2, v3 = v[:, 0], v[:, 1], v[:, 2]
+    # 构建反对称矩阵
+    zeros = torch.zeros(B, device=v.device)
+    skew = torch.stack(
+        [
+            torch.stack([zeros, -v3, v2], dim=1),
+            torch.stack([v3, zeros, -v1], dim=1),
+            torch.stack([-v2, v1, zeros], dim=1),
+        ],
+        dim=1,
+    )
+    return skew  # 形状 (B, 3, 3)
+
+
+def euler_to_rotation_matrix(
+    euler_angles: torch.Tensor, order: str = "ZYX"
+) -> torch.Tensor:
+    """
+    将欧拉角转换为旋转矩阵（支持批量输入）
+
+    Args:
+        euler_angles: 形状为 (batch_size, 3) 的张量，每个元素为 [ψ, θ, φ]（弧度）
+        order: 旋转顺序，默认为 'ZYX'
+
+    Returns:
+        旋转矩阵张量，形状为 (batch_size, 3, 3)
+    """
+    batch_size = euler_angles.shape[0]
+    psi, theta, phi = euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2]
+
+    # 预计算sin和cos
+    sin_psi, cos_psi = torch.sin(psi), torch.cos(psi)
+    sin_theta, cos_theta = torch.sin(theta), torch.cos(theta)
+    sin_phi, cos_phi = torch.sin(phi), torch.cos(phi)
+
+    # 构造各轴旋转矩阵（批量形式）
+    Rz = torch.zeros((batch_size, 3, 3), device=euler_angles.device)
+    Rz[:, 0, 0] = cos_psi
+    Rz[:, 0, 1] = -sin_psi
+    Rz[:, 1, 0] = sin_psi
+    Rz[:, 1, 1] = cos_psi
+    Rz[:, 2, 2] = 1.0
+
+    Ry = torch.zeros((batch_size, 3, 3), device=euler_angles.device)
+    Ry[:, 0, 0] = cos_theta
+    Ry[:, 0, 2] = sin_theta
+    Ry[:, 1, 1] = 1.0
+    Ry[:, 2, 0] = -sin_theta
+    Ry[:, 2, 2] = cos_theta
+
+    Rx = torch.zeros((batch_size, 3, 3), device=euler_angles.device)
+    Rx[:, 0, 0] = 1.0
+    Rx[:, 1, 1] = cos_phi
+    Rx[:, 1, 2] = -sin_phi
+    Rx[:, 2, 1] = sin_phi
+    Rx[:, 2, 2] = cos_phi
+
+    # 按顺序矩阵乘法（ZYX）
+    if order == "ZYX":
+        R = torch.bmm(Rz, torch.bmm(Ry, Rx))
+    elif order == "XYZ":
+        # 其他顺序需调整矩阵乘法顺序（如XYZ）
+        R = torch.bmm(Rx, torch.bmm(Ry, Rz))
+    else:
+        raise ValueError(f"Unsupported rotation order: {order}")
+
+    return R
+
+
 def val_epoch(model, val_loader, criterion, args):
     epoch_loss = 0
-    with tqdm(val_loader, unit="batch", ncols=70) as tepoch:
+    with tqdm(val_loader, unit="batch", dynamic_ncols=True) as tepoch:
         # for images, gt, g_gt in tepoch:
-        for images, gt in tepoch:
+        for images, pt1, pt2, gt in tepoch:
             tepoch.set_description(f"Validating ")
             # for batch_idx, (images, odom) in enumerate(train_loader):
             if torch.cuda.is_available():
@@ -44,30 +119,66 @@ def val_epoch(model, val_loader, criterion, args):
 import functools
 
 
+def denormailzation(angles, t, normalizations):
+    angles = (
+        torch.multiply(angles, normalizations["mean_angles"])
+        + normalizations["std_angles"]
+    )
+    t = torch.multiply(t, normalizations["mean_t"]) + normalizations["std_t"]
+    return angles, t
+
+
 def train_epoch(
-    model, train_loader, criterion, optimizer, epoch, tensorboard_writer, args
+    model,
+    train_loader,
+    criterion,
+    optimizer,
+    epoch,
+    tensorboard_writer,
+    args,
+    normalizations,
 ):
     epoch_loss = 0
     iter = (epoch - 1) * len(train_loader) + 1
+    iter = 1
+    e_loss = 0
 
-    with tqdm(train_loader, unit="batch", ncols=70) as tepoch:
-        # for images, gt, g_gt in tepoch:
+    with tqdm(train_loader, unit="batch", dynamic_ncols=True) as tepoch:
         for images, pt1, pt2, gt in tepoch:
             tepoch.set_description(f"Epoch {epoch}")
-            # for batch_idx, (images, odom) in enumerate(train_loader):
             if torch.cuda.is_available():
                 images, pt1, pt2, gt = images.cuda(), pt1.cuda(), pt2.cuda(), gt.cuda()
 
-            print("images shape: ", images.shape, "pt1 shape: ", pt1.shape)
             # predict pose
-            # estimated_pose, g_pose = model(images.float())
             estimated_pose = model(images.float())
-
-            # loss = compute_loss(estimated_pose, gt, criterion, args) +
-            loss = compute_loss(estimated_pose, gt, criterion, args)
-
-            # compute loss
-            # + compute_loss(g_pose, g_gt.cuda(), criterion, args)
+            # estimated_angles = estimated_pose[:, :, :3]
+            # estimated_t = estimated_pose[:, :, 3:]
+            # estimated_angles, estimated_t = denormailzation(
+            #     estimated_angles, estimated_t, normalizations
+            # )
+            # ones = torch.ones(pt1.shape[0], pt1.shape[1], 1).cuda()
+            # pt1 = torch.cat([pt1, ones], dim=-1)
+            # pt2 = torch.cat([pt2, ones], dim=-1)
+            # R = euler_to_rotation_matrix(estimated_angles.squeeze(1))
+            # t_x = vector_to_skew_symmetric(estimated_t.squeeze(1))
+            #
+            # E = torch.bmm(t_x, R)
+            # term = torch.bmm(
+            #     pt2.view(pt2.shape[0] * pt2.shape[1], 1, 3),
+            #     E.unsqueeze(1)
+            #     .expand(pt2.shape[0], pt2.shape[1], 3, 3)
+            #     .reshape(pt2.shape[0] * pt2.shape[1], 3, 3),
+            # )
+            # epipolar_loss = torch.bmm(
+            #     term,
+            #     pt1.view(pt1.shape[0] * pt1.shape[1], 3, 1),
+            # )
+            # print(epipolar_loss.abs().mean())
+            loss = (
+                compute_loss(estimated_pose, gt, criterion, args)
+                # + epipolar_loss.abs().mean()
+            )
+            # e_loss += epipolar_loss.abs().mean().item()
 
             # compute gradient and do optimizer step
             optimizer.zero_grad()
@@ -75,7 +186,9 @@ def train_epoch(
             optimizer.step()
 
             epoch_loss += loss.item()
-            tepoch.set_postfix(loss=loss.item())
+            # tepoch.set_postfix(loss=loss.item())
+            tepoch.set_postfix(loss=epoch_loss / iter)
+            # tepoch.set_postfix({"loss": epoch_loss / iter, "e_loss": e_loss / iter})
 
             # log tensorboard
             # tensorboard_writer.add_scalar('training_loss', loss.item(), iter)
@@ -89,12 +202,33 @@ def train(
     checkpoint_path = args["checkpoint_path"]
     epochs = args["epoch"]
     best_val = args["best_val"]
+    normalizations = {}
+    # self.mean_angles = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    # self.std_angles = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    # self.mean_t = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    # self.std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
+    normalizations["mean_angles"] = torch.Tensor(
+        [1.7061e-5, 9.5582e-4, -5.5258e-5]
+    ).cuda()
+    normalizations["std_angles"] = torch.Tensor(
+        [2.8256e-3, 1.7771e-2, 3.2326e-3]
+    ).cuda()
+    normalizations["mean_t"] = torch.Tensor([-8.6736e-5, -1.6038e-2, 9.0033e-1]).cuda()
+    normalizations["std_t"] = torch.Tensor([2.5584e-2, 1.8545e-2, 3.0352e-1]).cuda()
+
     # scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
     for epoch in range(args["epoch_init"], epochs):
         # training for one epoch
         model.train()
         train_loss = train_epoch(
-            model, train_loader, criterion, optimizer, epoch, tensorboard_writer, args
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            epoch,
+            tensorboard_writer,
+            args,
+            normalizations,
         )
         state = {
             "epoch": epoch,
@@ -104,7 +238,7 @@ def train(
         }
 
         # validate model
-        if val_loader and not epoch % 3:
+        if val_loader and not epoch % 2:
             with torch.no_grad():
                 model.eval()
                 val_loss = val_epoch(model, val_loader, criterion, args)
@@ -200,7 +334,7 @@ if __name__ == "__main__":
     # set hyperparameters and configuration
     args = {
         "data_dir": "data",
-        "bsize": 4,  # batch size
+        "bsize": 8,  # batch size
         "val_split": 0.1,  # percentage to use as validation data
         "window_size": 2,  # number of frames in window
         "overlap": 1,  # number of frames overlapped between windows
@@ -211,9 +345,9 @@ if __name__ == "__main__":
         "epoch": 300,  # train iters each timestep
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
-        "checkpoint_path": "checkpoints/Exp19",  # path to save checkpoint
-        # "checkpoint": "checkpoint_best.pth",  # checkpoint
-        "checkpoint": None,  # checkpoint
+        "checkpoint_path": "checkpoints/Exp22",  # path to save checkpoint
+        "checkpoint": "checkpoint_best.pth",  # checkpoint
+        # "checkpoint": None,  # checkpoint
     }
 
     # tiny  - patch_size=16, embed_dim=192, depth=12, num_heads=3
@@ -246,10 +380,18 @@ if __name__ == "__main__":
 
     # tensorboard writer
     TensorBoardWriter = SummaryWriter(log_dir=args["checkpoint_path"])
-    # tb = program.TensorBoard()
-    # tb.configure(argv=[None, '--logdir=checkpoints/Exp15', '--bind_all', '--port=6006'])
-    # url = tb.launch()
-    # print(f"TensorBoard URL ：{url}")
+    tb = program.TensorBoard()
+    tb.configure(
+        argv=[
+            None,
+            "--logdir_spec",
+            "Exp22:./checkpoints/Exp22",
+            "--bind_all",
+            "--port=6006",
+        ]
+    )
+    url = tb.launch()
+    print(f"TensorBoard URL ：{url}")
 
     # preprocessing operation
     preprocess = transforms.Compose(
@@ -281,11 +423,13 @@ if __name__ == "__main__":
     train_loader = torch.utils.data.DataLoader(
         train_data,
         batch_size=args["bsize"],
+        num_workers=8,
         shuffle=True,
     )
     val_loader = torch.utils.data.DataLoader(
         val_data,
         batch_size=1,
+        num_workers=8,
         shuffle=False,
     )
 

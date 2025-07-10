@@ -13,11 +13,14 @@ from datasets.kitti import KITTI
 
 # from timesformer.models.vit import CrossViT, CrossViT_loop, VisionTransformer
 from timesformer.models.vit_seq import CrossViT
+from timesformer.models.mamba import CrossVisionMamba
 
-checkpoint_path = "checkpoints/Exp18"
+checkpoint_path = "checkpoints/Exp22"
 checkpoint_name = "checkpoint_best"
 # sequences = ['00',"01", '02',"03", "04", "05", "06", "07", '08', '09', "10"]
 sequences = ["01", "03", "04", "05", "06", "07", "10"]
+# sequences = ["07"]
+# sequences = ["03", "07"]
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -58,21 +61,42 @@ preprocess = transforms.Compose(
 #                           attention_type=model_params["attention_type"])
 
 
-model = CrossViT(
+# model = CrossViT(
+#     image_height=model_params["image_size"][0],
+#     image_width=model_params["image_size"][1],
+#     patch_size=model_params["patch_size"],
+#     num_classes=256,
+#     dim=model_params["dim"],
+#     depth=model_params["depth"],
+#     heads=model_params["heads"],
+#     mlp_dim=1024,
+# )
+
+model = CrossVisionMamba(
     image_height=model_params["image_size"][0],
     image_width=model_params["image_size"][1],
     patch_size=model_params["patch_size"],
-    num_classes=256,
-    dim=model_params["dim"],
-    depth=model_params["depth"],
-    heads=model_params["heads"],
-    mlp_dim=1024,
+    num_classes=1000,
+    # patch_size=16,
+    embed_dim=192,
+    depth=16,
+    rms_norm=True,
+    residual_in_fp32=True,
+    fused_add_norm=True,
+    final_pool_type="mean",
+    if_abs_pos_embed=True,
+    if_rope=False,
+    if_rope_residual=False,
+    bimamba_type="V2",
+    if_cls_token=False,
+    use_double_cls_token=False,
 )
 
 
 checkpoint = torch.load(
     os.path.join(args["checkpoint_path"], "{}.pth".format(checkpoint_name)),
     map_location=torch.device(device),
+    weights_only=True,
 )
 print(args["checkpoint_path"])
 model.load_state_dict(checkpoint["model_state_dict"])
@@ -95,13 +119,14 @@ for sequence in sequences:
     test_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=4,
+        num_workers=10,
         shuffle=False,
     )
 
     with tqdm(test_loader, unit="batch") as batchs:
         pred_poses = np.zeros((1, args["window_size"] - 1, 6))
         batchs.set_description(f"Sequence {sequence}")
-        for images, gt in batchs:
+        for images, pt1, pt2, gt in batchs:
             if torch.cuda.is_available():
                 images, gt = images.cuda(), gt.cuda()
 
