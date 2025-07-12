@@ -336,18 +336,18 @@ if __name__ == "__main__":
         "data_dir": "data",
         "bsize": 8,  # batch size
         "val_split": 0.1,  # percentage to use as validation data
-        "window_size": 2,  # number of frames in window
-        "overlap": 1,  # number of frames overlapped between windows
+        "window_size": 3,  # number of frames in window
+        "overlap": 2,  # number of frames overlapped between windows
         "optimizer": "Adam",  # optimizer [Adam, SGD, Adagrad, RAdam]
         "lr": 1e-5,  # learning rate
         "momentum": 0.9,  # SGD momentum
         "weight_decay": 1e-4,  # SGD momentum
-        "epoch": 300,  # train iters each timestep
+        "epoch": 100,  # train iters each timestep
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
-        "checkpoint_path": "checkpoints/Exp22",  # path to save checkpoint
-        "checkpoint": "checkpoint_best.pth",  # checkpoint
-        # "checkpoint": None,  # checkpoint
+        "checkpoint_path": "checkpoints/Exp27",  # path to save checkpoint
+        # "checkpoint": "checkpoint_best.pth",  # checkpoint
+        "checkpoint": None,  # checkpoint
     }
 
     # tiny  - patch_size=16, embed_dim=192, depth=12, num_heads=3
@@ -380,18 +380,18 @@ if __name__ == "__main__":
 
     # tensorboard writer
     TensorBoardWriter = SummaryWriter(log_dir=args["checkpoint_path"])
-    tb = program.TensorBoard()
-    tb.configure(
-        argv=[
-            None,
-            "--logdir_spec",
-            "Exp22:./checkpoints/Exp22",
-            "--bind_all",
-            "--port=6006",
-        ]
-    )
-    url = tb.launch()
-    print(f"TensorBoard URL ：{url}")
+    # tb = program.TensorBoard()
+    # tb.configure(
+    #     argv=[
+    #         None,
+    #         "--logdir_spec",
+    #         "Exp22:./checkpoints/Exp22",
+    #         "--bind_all",
+    #         "--port=6006",
+    #     ]
+    # )
+    # url = tb.launch()
+    # print(f"TensorBoard URL ：{url}")
 
     # preprocessing operation
     preprocess = transforms.Compose(

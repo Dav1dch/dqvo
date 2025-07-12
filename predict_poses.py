@@ -15,7 +15,7 @@ from datasets.kitti import KITTI
 from timesformer.models.vit_seq import CrossViT
 from timesformer.models.mamba import CrossVisionMamba
 
-checkpoint_path = "checkpoints/Exp22"
+checkpoint_path = "checkpoints/Exp26"
 checkpoint_name = "checkpoint_best"
 # sequences = ['00',"01", '02',"03", "04", "05", "06", "07", '08', '09', "10"]
 sequences = ["01", "03", "04", "05", "06", "07", "10"]
@@ -103,8 +103,8 @@ model.load_state_dict(checkpoint["model_state_dict"])
 if torch.cuda.is_available():
     model.cuda()
 
-args["window_size"] = 2
-args["overlap"] = 1
+args["window_size"] = 4
+args["overlap"] = 3
 
 for sequence in sequences:
     # test dataloader

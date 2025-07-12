@@ -75,7 +75,7 @@ class KITTI(torch.utils.data.Dataset):
         data["sequence"] = seqs
         self.data = data
         self.read_intrinsics_param()
-        print(self.cam_params)
+        # print(self.cam_params)
         self.windowed_data = self.create_windowed_dataframe(data)
         if not os.path.exists("fp.pickle"):
             self.generate_fp()

@@ -23,6 +23,81 @@ except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
 
+class PatchEmbedMamba(nn.Module):
+    def __init__(
+        self,
+        # img_size=224,
+        img_size=(224, 224),
+        patch_size=16,
+        stride=16,
+        in_channels=3,
+        embed_dim=768,
+        norm_layer=None,
+        flatten=True,
+    ):
+        super(PatchEmbedMamba, self).__init__()
+        # img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)  # 将img_size和patch_size化成元组的形式
+        self.img_size = img_size
+        self.patch_size = patch_size
+        # 一个patch形成一个grid（网格），这里记录网格的形状
+        self.grid_size = (
+            (img_size[0] - patch_size[0]) // stride + 1,
+            (img_size[1] - patch_size[1]) // stride + 1,
+        )
+        self.num_patches = self.grid_size[0] * self.grid_size[1]  # 总共的patch个数
+        self.flatten = flatten
+        # 打patch的操作，实际为卷积的操作(为了不重复卷积，步长的大小理论上因该等于卷积核的大小）
+        self.proj = nn.Conv2d(
+            in_channels, embed_dim, kernel_size=patch_size, stride=stride
+        )
+        ssm_cfg = {}
+        factory_kwargs = {"device": None, "dtype": None}
+
+        self.layers = nn.ModuleList(
+            [
+                create_block(  # 对VisionMamba的Encoder进行初始化的操作
+                    embed_dim,
+                    ssm_cfg=None,
+                    norm_epsilon=1e-5,
+                    rms_norm=True,
+                    residual_in_fp32=True,
+                    fused_add_norm="mean",
+                    layer_idx=i,
+                    if_bimamba=False,
+                    bimamba_type="V2",
+                    drop_path=0.2,
+                    if_divide_out=False,
+                    init_layer_scale=None,
+                    **factory_kwargs,
+                )
+                for i in range(2)
+            ]
+        )
+        self.norm = (
+            norm_layer(embed_dim) if norm_layer else nn.Identity()
+        )  # nn.Identity的输入等于输出，通常作为占位层使用
+
+    def forward(self, x):
+        B, C, L, H, W = x.shape
+        assert (
+            H == self.img_size[0] and W == self.img_size[1]
+        ), f"Input img size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})"
+        x = x.view(B * L, C, H, W)
+        x = self.proj(x)  # B,C,H,W——>B,embed_dim,grid_size,grid_size
+        if self.flatten:
+            x = x.flatten(2).transpose(
+                1, 2
+            )  # B,embed_dim,grid_size,grid_size——>B,embed_dim,grid_size*grid_size——>B,grid_size*grid_size,embed_dim
+        x = self.norm(x)
+        x = x.reshape(B * self.grid_size[0] * self.grid_size[1], L, -1)
+        residule = None
+        for layer in self.layers:
+            x, residule = layer(x, residule)
+        x = x[:, 1:].reshape(B * (L - 1), self.grid_size[0] * self.grid_size[1], -1)
+        return x
+
+
 class PatchEmbedCross(nn.Module):
     def __init__(
         self,
@@ -308,7 +383,7 @@ class CrossVisionMamba(nn.Module):
             .cuda()
         )
 
-        self.patch_embed = PatchEmbedCross(
+        self.patch_embed = PatchEmbedMamba(
             img_size=(image_height, image_width),
             patch_size=patch_size,
             stride=stride,
@@ -614,16 +689,17 @@ class CrossVisionMamba(nn.Module):
         if_random_token_rank=False,
     ):
         # x = x.permute(0, 2, 1, 3, 4)
+        # print(x.shape)
         b = x.size(0)
         l = x.size(2) - 1
-        x1 = x[:, :, :-1]
-        x2 = x[:, :, 1:]
-        x_new = torch.cat(
-            (x1.reshape(b * l, 3, 1, 192, 640), x2.reshape(b * l, 3, 1, 192, 640)),
-            dim=2,
-        )
+        # x1 = x[:, :, :-1]
+        # x2 = x[:, :, 1:]
+        # x_new = torch.cat(
+        #     (x1.reshape(b * l, 3, 1, 192, 640), x2.reshape(b * l, 3, 1, 192, 640)),
+        #     dim=2,
+        # )
         x = self.forward_features(
-            x_new,
+            x,
             inference_params,
             if_random_cls_token_position=if_random_cls_token_position,
             if_random_token_rank=if_random_token_rank,

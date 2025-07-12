@@ -141,7 +141,7 @@ def recover_trajectory_and_poses(poses, norm):
 
 if __name__ == "__main__":
 
-    ckpt_path = "checkpoints/Exp22/"
+    ckpt_path = "checkpoints/Exp26/"
     ckpt_name = "checkpoint_best"
     sequences = ["01", "03", "04", "05", "06", "07", "10"]
     # sequences = ['00',"01",'02', "03", "04", "05", "06", "07", '08', '09',"10"]
@@ -152,8 +152,8 @@ if __name__ == "__main__":
     with open(os.path.join(ckpt_path, "args.pkl"), "rb") as f:
         args = pickle.load(f)
     f.close()
-    args["window_size"] = 2
-    args["overlap"] = 1
+    args["window_size"] = 4
+    args["overlap"] = 3
 
     ckpt_path = os.path.join(ckpt_path, ckpt_name)
     args["checkpoint_path"] = ckpt_path
