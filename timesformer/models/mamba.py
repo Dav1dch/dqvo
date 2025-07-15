@@ -31,7 +31,7 @@ class PatchEmbedMamba(nn.Module):
         patch_size=16,
         stride=16,
         in_channels=3,
-        embed_dim=768,
+        embed_dim=256,
         norm_layer=None,
         flatten=True,
     ):
@@ -61,7 +61,7 @@ class PatchEmbedMamba(nn.Module):
                     ssm_cfg=None,
                     norm_epsilon=1e-5,
                     rms_norm=True,
-                    residual_in_fp32=True,
+                    residual_in_fp32=False,
                     fused_add_norm="mean",
                     layer_idx=i,
                     if_bimamba=False,
@@ -71,7 +71,7 @@ class PatchEmbedMamba(nn.Module):
                     init_layer_scale=None,
                     **factory_kwargs,
                 )
-                for i in range(2)
+                for i in range(3)
             ]
         )
         self.norm = (
@@ -322,7 +322,7 @@ class CrossVisionMamba(nn.Module):
         num_classes=1000,  # 这里用imagenet做分类任务所以有1000个类，也就代表了最后的mlp的输出层包含1000个节点
         ssm_cfg=None,  # ssm的配置文件
         drop_rate=0.0,  # drop_rate是针对于dropout的频率（对某个节点进行失活的操作）
-        drop_path_rate=0.1,  # drop_path_rate是针对drop_path的频率（对某个层进行失活的操作）
+        drop_path_rate=0.2,  # drop_path_rate是针对drop_path的频率（对某个层进行失活的操作）
         norm_epsilon: float = 1e-5,
         rms_norm: bool = False,  # 是否使用rms_norm这种方法
         fused_add_norm=False,
@@ -486,7 +486,7 @@ class CrossVisionMamba(nn.Module):
     ):
         x = self.patch_embed(x)
         B, M, _ = x.shape
-        x = x[:, self.spiral_indice, :]
+        # x = x[:, self.spiral_indice, :]
 
         if self.if_cls_token:
             if self.use_double_cls_token:  # 在序列前后拼double_cls_token
@@ -668,10 +668,10 @@ class CrossVisionMamba(nn.Module):
         if self.final_pool_type == "none":
             return hidden_states[:, -1, :]  # 这个切片是为了之后的mlp所做出的妥协
         elif self.final_pool_type == "mean":
-            weight = self.spiral_weight
-            hidden_states = hidden_states * weight.repeat(
-                (hidden_states.shape[0], 1)
-            ).unsqueeze(-1)
+            # weight = self.spiral_weight
+            # hidden_states = hidden_states * weight.repeat(
+            #     (hidden_states.shape[0], 1)
+            # ).unsqueeze(-1)
             return hidden_states.mean(dim=1)
         elif self.final_pool_type == "max":
             return hidden_states

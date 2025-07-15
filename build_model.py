@@ -84,7 +84,7 @@ def build_model(args, model_params):
         patch_size=model_params["patch_size"],
         num_classes=1000,
         # patch_size=16,
-        embed_dim=256,
+        embed_dim=192,
         depth=16,
         rms_norm=True,
         residual_in_fp32=True,

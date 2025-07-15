@@ -345,7 +345,7 @@ if __name__ == "__main__":
         "epoch": 100,  # train iters each timestep
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
-        "checkpoint_path": "checkpoints/Exp27",  # path to save checkpoint
+        "checkpoint_path": "checkpoints/Exp29",  # path to save checkpoint
         # "checkpoint": "checkpoint_best.pth",  # checkpoint
         "checkpoint": None,  # checkpoint
     }
