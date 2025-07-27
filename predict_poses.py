@@ -15,7 +15,7 @@ from datasets.kitti import KITTI
 from timesformer.models.vit_seq import CrossViT
 from timesformer.models.mamba import CrossVisionMamba
 
-checkpoint_path = "checkpoints/Exp29"
+checkpoint_path = "checkpoints/Exp30"
 checkpoint_name = "checkpoint_best"
 # sequences = ['00',"01", '02',"03", "04", "05", "06", "07", '08', '09', "10"]
 sequences = ["01", "03", "04", "05", "06", "07", "10"]
@@ -79,7 +79,7 @@ model = CrossVisionMamba(
     num_classes=1000,
     # patch_size=16,
     embed_dim=192,
-    depth=16,
+    depth=model_params["depth"],
     rms_norm=True,
     residual_in_fp32=True,
     fused_add_norm=True,

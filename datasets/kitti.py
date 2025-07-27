@@ -272,6 +272,7 @@ if __name__ == "__main__":
     preprocess = transforms.Compose(
         [
             transforms.Resize((192, 640)),
+            # transforms.Resize((224, 678)),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.34721234, 0.36705238, 0.36066107],

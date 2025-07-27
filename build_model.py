@@ -85,7 +85,7 @@ def build_model(args, model_params):
         num_classes=1000,
         # patch_size=16,
         embed_dim=192,
-        depth=16,
+        depth=model_params["depth"],
         rms_norm=True,
         residual_in_fp32=True,
         fused_add_norm=True,
