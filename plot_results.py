@@ -141,7 +141,7 @@ def recover_trajectory_and_poses(poses, norm):
 
 if __name__ == "__main__":
 
-    ckpt_path = "checkpoints/Exp30/"
+    ckpt_path = "checkpoints/Exp31/"
     ckpt_name = "checkpoint_best"
     sequences = ["01", "03", "04", "05", "06", "07", "10"]
     # sequences = ['00',"01",'02', "03", "04", "05", "06", "07", '08', '09',"10"]

@@ -11,6 +11,7 @@ from timesformer.models.helpers import load_pretrained
 # from timesformer.models.vit import CrossViT, VisionTransformer
 from timesformer.models.vit_seq import CrossViT
 from timesformer.models.mamba import CrossVisionMamba
+from timesformer.models.swvit import VisionTransformer
 
 default_cfgs = {
     "vit_patch16_edim768": {
@@ -82,6 +83,7 @@ def build_model(args, model_params):
         image_height=model_params["image_size"][0],
         image_width=model_params["image_size"][1],
         patch_size=model_params["patch_size"],
+        stride=model_params["patch_size"],
         num_classes=1000,
         # patch_size=16,
         embed_dim=192,

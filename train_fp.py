@@ -345,8 +345,8 @@ if __name__ == "__main__":
         "epoch": 100,  # train iters each timestep
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
-        "checkpoint_path": "checkpoints/Exp30",  # path to save checkpoint
-        # "checkpoint": "checkpoint_best.pth",  # checkpoint
+        "checkpoint_path": "checkpoints/Exp31",  # path to save checkpoint
+        # "checkpoint": "checkpoint_last.pth",  # checkpoint
         "checkpoint": None,  # checkpoint
     }
 
@@ -355,17 +355,17 @@ if __name__ == "__main__":
     # base  - patch_size=16, embed_dim=768, depth=12, num_heads=12
     model_params = {
         "dim": 384,
-        # "image_size": (224, 678),  # (192, 640),
-        "image_size": (192, 640),  # (192, 640),
+        "image_size": (224, 678),  # (192, 640),
+        # "image_size": (192, 640),  # (192, 640),
         "patch_size": 16,
         "attention_type": "divided_space_time",  # ['divided_space_time', 'space_only','joint_space_time', 'time_only']
         "num_frames": args["window_size"],
         "num_classes": 6 * (args["window_size"] - 1),  # 6 DoF for each frame
         "depth": 16,
-        "heads": 3,
+        "heads": 8,
         "dim_head": 64,
-        "attn_dropout": 0.2,
-        "ff_dropout": 0.2,
+        "attn_dropout": 0.1,
+        "ff_dropout": 0.1,
         "time_only": False,
     }
     args["model_params"] = model_params
@@ -424,13 +424,13 @@ if __name__ == "__main__":
     train_loader = torch.utils.data.DataLoader(
         train_data,
         batch_size=args["bsize"],
-        num_workers=8,
+        num_workers=4,
         shuffle=True,
     )
     val_loader = torch.utils.data.DataLoader(
         val_data,
         batch_size=1,
-        num_workers=8,
+        num_workers=4,
         shuffle=False,
     )
 
