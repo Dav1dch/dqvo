@@ -21,9 +21,10 @@ torch.manual_seed(2023)
 
 def val_epoch(model, val_loader, criterion, args):
     epoch_loss = 0
-    with tqdm(val_loader, unit="batch", ncols=70) as tepoch:
+    with tqdm(val_loader, unit="batch", dynamic_ncols=True) as tepoch:
         # for images, gt, g_gt in tepoch:
-        for images, gt in tepoch:
+        # for images, gt in tepoch:
+        for images, pt1, pt2, gt in tepoch:
             tepoch.set_description(f"Validating ")
             # for batch_idx, (images, odom) in enumerate(train_loader):
             if torch.cuda.is_available():
@@ -50,7 +51,7 @@ def train_epoch(
     epoch_loss = 0
     iter = (epoch - 1) * len(train_loader) + 1
 
-    with tqdm(train_loader, unit="batch", ncols=70) as tepoch:
+    with tqdm(train_loader, unit="batch", dynamic_ncols=True) as tepoch:
         # for images, gt, g_gt in tepoch:
         for images, pt1, pt2, gt in tepoch:
             tepoch.set_description(f"Epoch {epoch}")
@@ -58,7 +59,6 @@ def train_epoch(
             if torch.cuda.is_available():
                 images, pt1, pt2, gt = images.cuda(), pt1.cuda(), pt2.cuda(), gt.cuda()
 
-            print("images shape: ", images.shape, "pt1 shape: ", pt1.shape)
             # predict pose
             # estimated_pose, g_pose = model(images.float())
             estimated_pose = model(images.float())
@@ -195,15 +195,36 @@ def compute_loss(y_hat, y, criterion, args):
     return loss
 
 
+def compute_loss(y_hat, y, criterion, args):
+    if args["weighted_loss"] == None:
+        loss = criterion(y_hat, y.float())
+    else:
+        y = torch.reshape(y, (y.shape[0], args["window_size"] - 1, 6))
+        gt_angles = y[:, :, :3].flatten()
+        gt_translation = y[:, :, 3:].flatten()
+
+        # predict pose
+        y_hat = torch.reshape(y_hat, (y_hat.shape[0], args["window_size"] - 1, 6))
+        estimated_angles = y_hat[:, :, :3].flatten()
+        estimated_translation = y_hat[:, :, 3:].flatten()
+
+        # compute custom loss
+        k = args["weighted_loss"]
+        loss_angles = k * criterion(estimated_angles, gt_angles.float())
+        loss_translation = criterion(estimated_translation, gt_translation.float())
+        loss = loss_angles + loss_translation
+    return loss
+
+
 if __name__ == "__main__":
 
     # set hyperparameters and configuration
     args = {
         "data_dir": "data",
-        "bsize": 4,  # batch size
+        "bsize": 8,  # batch size
         "val_split": 0.1,  # percentage to use as validation data
-        "window_size": 2,  # number of frames in window
-        "overlap": 1,  # number of frames overlapped between windows
+        "window_size": 3,  # number of frames in window
+        "overlap": 2,  # number of frames overlapped between windows
         "optimizer": "Adam",  # optimizer [Adam, SGD, Adagrad, RAdam]
         "lr": 1e-5,  # learning rate
         "momentum": 0.9,  # SGD momentum
@@ -211,7 +232,7 @@ if __name__ == "__main__":
         "epoch": 300,  # train iters each timestep
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
-        "checkpoint_path": "checkpoints/Exp19",  # path to save checkpoint
+        "checkpoint_path": "checkpoints/Exp36",  # path to save checkpoint
         # "checkpoint": "checkpoint_best.pth",  # checkpoint
         "checkpoint": None,  # checkpoint
     }
@@ -221,7 +242,8 @@ if __name__ == "__main__":
     # base  - patch_size=16, embed_dim=768, depth=12, num_heads=12
     model_params = {
         "dim": 384,
-        "image_size": (192, 640),  # (192, 640),
+        # "image_size": (192, 640),  # (192, 640),
+        "image_size": (224, 672),  # (192, 640),
         "patch_size": 16,
         "attention_type": "divided_space_time",  # ['divided_space_time', 'space_only','joint_space_time', 'time_only']
         "num_frames": args["window_size"],
@@ -281,12 +303,14 @@ if __name__ == "__main__":
     train_loader = torch.utils.data.DataLoader(
         train_data,
         batch_size=args["bsize"],
+        num_workers=4,
         shuffle=True,
     )
     val_loader = torch.utils.data.DataLoader(
         val_data,
         batch_size=1,
         shuffle=False,
+        num_workers=4,
     )
 
     # build and load model

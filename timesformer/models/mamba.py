@@ -389,6 +389,7 @@ class CrossVisionMamba(nn.Module):
             stride=stride,
             in_channels=channels,
             embed_dim=embed_dim,
+            norm_layer=nn.LayerNorm,
         )
         num_patches = self.patch_embed.num_patches
 
@@ -421,7 +422,7 @@ class CrossVisionMamba(nn.Module):
         #    )
         self.head = (
             nn.Sequential(
-                nn.BatchNorm1d(self.num_features),
+                nn.LayerNorm(self.num_features),
                 nn.Linear(self.num_features, num_classes),
                 nn.ReLU(),
                 nn.Linear(self.num_classes, 6),
@@ -486,7 +487,7 @@ class CrossVisionMamba(nn.Module):
     ):
         x = self.patch_embed(x)
         B, M, _ = x.shape
-        x = x[:, self.spiral_indice, :]
+        # x = x[:, self.spiral_indice, :]
 
         if self.if_cls_token:
             if self.use_double_cls_token:  # 在序列前后拼double_cls_token
@@ -668,10 +669,10 @@ class CrossVisionMamba(nn.Module):
         if self.final_pool_type == "none":
             return hidden_states[:, -1, :]  # 这个切片是为了之后的mlp所做出的妥协
         elif self.final_pool_type == "mean":
-            weight = self.spiral_weight
-            hidden_states = hidden_states * weight.repeat(
-                (hidden_states.shape[0], 1)
-            ).unsqueeze(-1)
+            # weight = self.spiral_weight
+            # hidden_states = hidden_states * weight.repeat(
+            #     (hidden_states.shape[0], 1)
+            # ).unsqueeze(-1)
             return hidden_states.mean(dim=1)
         elif self.final_pool_type == "max":
             return hidden_states

@@ -11,11 +11,11 @@ from tqdm import tqdm
 from build_model import build_model
 from datasets.kitti import KITTI
 
-# from timesformer.models.vit import CrossViT, CrossViT_loop, VisionTransformer
+from timesformer.models.vit import VisionTransformer
 from timesformer.models.vit_seq import CrossViT
 from timesformer.models.mamba import CrossVisionMamba
 
-checkpoint_path = "checkpoints/Exp31"
+checkpoint_path = "checkpoints/Exp36"
 checkpoint_name = "checkpoint_best"
 # sequences = ['00',"01", '02',"03", "04", "05", "06", "07", '08', '09', "10"]
 sequences = ["01", "03", "04", "05", "06", "07", "10"]
@@ -45,20 +45,22 @@ preprocess = transforms.Compose(
 )
 
 # build and load model
-# model = VisionTransformer(img_size=model_params["image_size"],
-#                           num_classes=model_params["num_classes"],
-#                           patch_size=model_params["patch_size"],
-#                           embed_dim=model_params["dim"],
-#                           depth=model_params["depth"],
-#                           num_heads=model_params["heads"],
-#                           mlp_ratio=4,
-#                           qkv_bias=True,
-#                           norm_layer=partial(nn.LayerNorm, eps=1e-6),
-#                           drop_rate=0.,
-#                           attn_drop_rate=0.,
-#                           drop_path_rate=0.1,
-#                           num_frames=model_params["num_frames"],
-#                           attention_type=model_params["attention_type"])
+model = VisionTransformer(
+    img_size=model_params["image_size"],
+    num_classes=model_params["num_classes"],
+    patch_size=model_params["patch_size"],
+    embed_dim=model_params["dim"],
+    depth=model_params["depth"],
+    num_heads=model_params["heads"],
+    mlp_ratio=4,
+    qkv_bias=True,
+    norm_layer=partial(nn.LayerNorm, eps=1e-6),
+    drop_rate=0.0,
+    attn_drop_rate=0.0,
+    drop_path_rate=0.1,
+    num_frames=model_params["num_frames"],
+    attention_type=model_params["attention_type"],
+)
 
 
 # model = CrossViT(
@@ -72,25 +74,25 @@ preprocess = transforms.Compose(
 #     mlp_dim=1024,
 # )
 
-model = CrossVisionMamba(
-    image_height=model_params["image_size"][0],
-    image_width=model_params["image_size"][1],
-    patch_size=model_params["patch_size"],
-    num_classes=1000,
-    # patch_size=16,
-    embed_dim=192,
-    depth=model_params["depth"],
-    rms_norm=True,
-    residual_in_fp32=True,
-    fused_add_norm=True,
-    final_pool_type="mean",
-    if_abs_pos_embed=True,
-    if_rope=False,
-    if_rope_residual=False,
-    bimamba_type="V2",
-    if_cls_token=False,
-    use_double_cls_token=False,
-)
+# model = CrossVisionMamba(
+#     image_height=model_params["image_size"][0],
+#     image_width=model_params["image_size"][1],
+#     patch_size=model_params["patch_size"],
+#     num_classes=1000,
+#     # patch_size=16,
+#     embed_dim=192,
+#     depth=model_params["depth"],
+#     rms_norm=True,
+#     residual_in_fp32=True,
+#     fused_add_norm=True,
+#     final_pool_type="mean",
+#     if_abs_pos_embed=True,
+#     if_rope=False,
+#     if_rope_residual=False,
+#     bimamba_type="V2",
+#     if_cls_token=False,
+#     use_double_cls_token=False,
+# )
 
 
 checkpoint = torch.load(
