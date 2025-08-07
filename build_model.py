@@ -11,7 +11,7 @@ from timesformer.models.helpers import load_pretrained
 from timesformer.models.vit import VisionTransformer
 
 # from timesformer.models.vit_seq import CrossViT
-from timesformer.models.mamba import CrossVisionMamba
+# from timesformer.models.mamba import CrossVisionMamba
 
 # from timesformer.models.swvit import VisionTransformer
 
