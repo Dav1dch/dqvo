@@ -7,6 +7,11 @@ __pycache__/
 *.mo
 *.pot
 
+# gnn fp
+gnn_ba_output/
+*.pth
+Exp53/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 

@@ -5,13 +5,14 @@ import pickle
 import torch
 import torch.optim as optim
 from torch.utils.data import random_split
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 from torchvision import transforms
 from tqdm import tqdm
 
 from build_model import build_model
 from datasets.kitti import KITTI
 from datasets.utils import euler_to_rotation_torch
+from timesformer.models.losses import dual_quaternion_loss, quaternion_loss_weighted
 
 # from tensorboard import program
 
@@ -104,7 +105,7 @@ def train(
         }
 
         # validate model
-        if val_loader and not epoch % 3:
+        if val_loader and not epoch % 1:
             with torch.no_grad():
                 model.eval()
                 val_loss = val_epoch(model, val_loader, criterion, args)
@@ -165,7 +166,7 @@ def get_optimizer(params, args):
         )
 
     # load checkpoint
-    if args["checkpoint"] is not None:
+    if args["checkpoint"] is not None and args["checkpoint"] != "base.pth":
         checkpoint = torch.load(
             os.path.join(args["checkpoint_path"], args["checkpoint"])
         )
@@ -175,45 +176,67 @@ def get_optimizer(params, args):
 
 
 def compute_loss(y_hat, y, criterion, args):
-    if args["weighted_loss"] == None:
-        loss = criterion(y_hat, y.float())
+    # Check if we're using dual quaternion representation
+    if args.get("use_dual_quaternion", False):
+        # y shape: (batch_size, window_size-1, 7) for dual quaternion
+        # y_hat shape: (batch_size, window_size-1, 7) for dual quaternion
+        batch_size = y.shape[0]
+        window_size = args["window_size"]
+
+        # Reshape to (batch_size * (window_size-1), 7)
+        y_flat = y.reshape(-1, 7)
+        y_hat_flat = y_hat.reshape(-1, 7)
+
+        # Compute dual quaternion loss
+        if args["weighted_loss"] is None:
+            loss = dual_quaternion_loss(y_hat_flat, y_flat)
+        else:
+            # Use weighted dual quaternion loss
+            k = args["weighted_loss"]
+            loss = quaternion_loss_weighted(
+                y_hat_flat, y_flat, weight_rot=k, weight_trans=1.0
+            )
     else:
-        y = torch.reshape(y, (y.shape[0], args["window_size"] - 1, 6))
-        gt_angles = y[:, :, :3].flatten()
-        gt_translation = y[:, :, 3:].flatten()
+        # Original Euler angle + translation representation
+        if args["weighted_loss"] == None:
+            loss = criterion(y_hat, y.float())
+        else:
+            y = torch.reshape(y, (y.shape[0], args["window_size"] - 1, 6))
+            gt_angles = y[:, :, :3].flatten()
+            gt_translation = y[:, :, 3:].flatten()
 
-        # predict pose
-        y_hat = torch.reshape(y_hat, (y_hat.shape[0], args["window_size"] - 1, 6))
-        estimated_angles = y_hat[:, :, :3].flatten()
-        estimated_translation = y_hat[:, :, 3:].flatten()
+            # predict pose
+            y_hat = torch.reshape(y_hat, (y_hat.shape[0], args["window_size"] - 1, 6))
+            estimated_angles = y_hat[:, :, :3].flatten()
+            estimated_translation = y_hat[:, :, 3:].flatten()
 
-        # compute custom loss
-        k = args["weighted_loss"]
-        loss_angles = k * criterion(estimated_angles, gt_angles.float())
-        loss_translation = criterion(estimated_translation, gt_translation.float())
-        loss = loss_angles + loss_translation
+            # compute custom loss
+            k = args["weighted_loss"]
+            loss_angles = k * criterion(estimated_angles, gt_angles.float())
+            loss_translation = criterion(estimated_translation, gt_translation.float())
+            loss = loss_angles + loss_translation
     return loss
 
 
-def compute_loss(y_hat, y, criterion, args):
-    if args["weighted_loss"] == None:
-        loss = criterion(y_hat, y.float())
-    else:
-        y = torch.reshape(y, (y.shape[0], args["window_size"] - 1, 6))
-        gt_angles = y[:, :, :3].flatten()
-        gt_translation = y[:, :, 3:].flatten()
+# def compute_loss(y_hat, y, criterion, args):
+#     if args["weighted_loss"] == None:
+#         loss = criterion(y_hat, y.float())
+#     else:
+#         y = torch.reshape(y, (y.shape[0], args["window_size"] - 1, 6))
+#         gt_angles = y[:, :, :3].flatten()
+#         gt_translation = y[:, :, 3:].flatten()
 
-        # predict pose
-        y_hat = torch.reshape(y_hat, (y_hat.shape[0], args["window_size"] - 1, 6))
-        estimated_angles = y_hat[:, :, :3].flatten()
-        estimated_translation = y_hat[:, :, 3:].flatten()
+#         # predict pose
+#         y_hat = torch.reshape(y_hat, (y_hat.shape[0], args["window_size"] - 1, 6))
+#         estimated_angles = y_hat[:, :, :3].flatten()
+#         estimated_translation = y_hat[:, :, 3:].flatten()
 
-        # compute custom loss
-        k = args["weighted_loss"]
-        loss_angles = k * criterion(estimated_angles, gt_angles.float())
-        loss_translation = criterion(estimated_translation, gt_translation.float())
-        loss = loss_angles + loss_translation
-    return loss
+#         # compute custom loss
+#         k = args["weighted_loss"]
+#         loss_angles = k * criterion(estimated_angles, gt_angles.float())
+#         loss_translation = criterion(estimated_translation, gt_translation.float())
+#         loss = loss_angles + loss_translation
+#     return loss
 
 
 if __name__ == "__main__":
@@ -232,9 +255,11 @@ if __name__ == "__main__":
         "epoch": 300,  # train iters each timestep
         "weighted_loss": None,  # float to weight angles in loss function
         "pretrained_ViT": False,  # load weights from pre-trained ViT
-        "checkpoint_path": "checkpoints/Exp36",  # path to save checkpoint
-        # "checkpoint": "checkpoint_best.pth",  # checkpoint
+        "checkpoint_path": "checkpoints/Exp53",  # path to save checkpoint
+        # "checkpoint": "base.pth",  # checkpoint
         "checkpoint": None,  # checkpoint
+        # "checkpoint": "checkpoint_best.pth",  # checkpoint
+        "use_dual_quaternion": True,
     }
 
     # tiny  - patch_size=16, embed_dim=192, depth=12, num_heads=3
@@ -248,8 +273,8 @@ if __name__ == "__main__":
         "attention_type": "divided_space_time",  # ['divided_space_time', 'space_only','joint_space_time', 'time_only']
         "num_frames": args["window_size"],
         "num_classes": 6 * (args["window_size"] - 1),  # 6 DoF for each frame
-        "depth": 12,
-        "heads": 3,
+        "depth": 16,
+        "heads": 6,
         "dim_head": 64,
         "attn_dropout": 0.2,
         "ff_dropout": 0.2,
@@ -323,6 +348,11 @@ if __name__ == "__main__":
     # loss and optimizer
     criterion = torch.nn.MSELoss()
     optimizer = get_optimizer(model.parameters(), args)
+    # print("Parameter tracking状态:")
+    # for i, (name, param) in enumerate(model.named_parameters()):
+    #     print(f"ID {i}: {name} - requires_grad: {param.requires_grad}")
+    # if i >= 40:  # 只看前40个参数
+    #     break
 
     # train network
     print(20 * "--" + " Training " + 20 * "--")

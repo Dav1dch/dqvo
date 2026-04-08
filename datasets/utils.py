@@ -4,26 +4,87 @@ import cv2
 import numpy as np
 import torch
 
+from scipy.spatial.transform import Rotation
 
-def extract_fp(cvimage1, cvimage2):
-    orb = cv2.ORB_create()
 
+def convert_tartan_pose_to_kitti(x, y, z, qx, qy, qz, qw):
+    """
+    Convert TartanAir pose to KITTI-format 3x4 transformation matrix.
+
+    Args:
+        x, y, z: Position coordinates
+        qw, qx, qy, qz: Orientation as unit quaternion (scalar first)
+
+    Returns:
+        np.ndarray: 3x4 transformation matrix in KITTI format
+    """
+    # Construct rotation matrix from quaternion
+    R = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()  # Scipy uses [x,y,z,w]
+
+    # Extract rotation matrix components
+    r00, r01, r02 = R[0]
+    r10, r11, r12 = R[1]
+    r20, r21, r22 = R[2]
+
+    # Build KITTI 3x4 matrix:
+    #   Remap axes:
+    #     KITTI X (forward)  <- Tartan Z
+    #     KITTI Y (left)     <- Tartan X (negated)
+    #     KITTI Z (up)       <- Tartan Y (negated)
+    kitti_pose = np.array(
+        [
+            # [r22, -r20, -r21, z],  # X-row
+            # [-r02, r00, r01, -x],  # Y-row
+            # [-r12, r10, r11, -y],  # Z-row
+            [r22, -r20, -r21, x],  # X-row
+            [-r02, r00, r01, y],  # Y-row
+            [-r12, r10, r11, z],  # Z-row
+        ]
+    )
+
+    return kitti_pose
+
+
+def extract_fp(cvimage1, cvimage2, max_points=100):
+    """
+    Extract matching feature points using ORB.
+    
+    Args:
+        cvimage1: First grayscale image
+        cvimage2: Second grayscale image
+        max_points: Maximum number of feature matches to extract
+        
+    Returns:
+        pt1: Feature points in first image [N, 2] (pixel coordinates)
+        pt2: Feature points in second image [N, 2] (pixel coordinates)
+    """
+    orb = cv2.ORB_create(nfeatures=500)
+    
     k1, d1 = orb.detectAndCompute(cvimage1, None)
     k2, d2 = orb.detectAndCompute(cvimage2, None)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-
-    matches = bf.match(d1, d2)
-
-    matches = sorted(matches, key=lambda x: x.distance)
-
-    pt1 = []
-    pt2 = []
-
-    for m in matches[:50]:
-        pt1.append([list(map(round, list(k1[m.queryIdx].pt)))])
-        pt2.append([list(map(round, list(k2[m.trainIdx].pt)))])
-    pt1 = torch.Tensor(pt1).float().squeeze(1)
-    pt2 = torch.Tensor(pt2).float().squeeze(1)
+    
+    if d1 is None or d2 is None or len(k1) < 2 or len(k2) < 2:
+        return np.array([]), np.array([])
+    
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    matches = bf.knnMatch(d1, d2, k=2)
+    
+    good_matches = []
+    for m_n in matches:
+        if len(m_n) == 2:
+            m, n = m_n
+            if m.distance < 0.75 * n.distance:
+                good_matches.append(m)
+    
+    good_matches = sorted(good_matches, key=lambda x: x.distance)
+    good_matches = good_matches[:max_points]
+    
+    if len(good_matches) < 4:
+        return np.array([]), np.array([])
+    
+    pt1 = np.array([k1[m.queryIdx].pt for m in good_matches], dtype=np.float32)
+    pt2 = np.array([k2[m.trainIdx].pt for m in good_matches], dtype=np.float32)
+    
     return pt1, pt2
 
 
@@ -369,3 +430,218 @@ def euler_to_rotation_torch(xyz, isRadian=True, seq="zyx"):
         if Ms:
             return functools.reduce(torch.dot, Ms[::-1])
         return torch.eye(3)
+
+
+def matrix_to_quaternion(R):
+    """
+    Convert rotation matrix to quaternion.
+    
+    Args:
+        R: 3x3 rotation matrix
+        
+    Returns:
+        quaternion: [qw, qx, qy, qz] (scalar first)
+    """
+    # Use scipy's Rotation class
+    rot = Rotation.from_matrix(R)
+    quat = rot.as_quat()  # Returns [x, y, z, w]
+    # Convert to [w, x, y, z]
+    return np.array([quat[3], quat[0], quat[1], quat[2]])
+
+
+def quaternion_to_matrix(q):
+    """
+    Convert quaternion to rotation matrix.
+    
+    Args:
+        q: [qw, qx, qy, qz] (scalar first)
+        
+    Returns:
+        R: 3x3 rotation matrix
+    """
+    # Convert from [w, x, y, z] to [x, y, z, w]
+    quat = np.array([q[1], q[2], q[3], q[0]])
+    rot = Rotation.from_quat(quat)
+    return rot.as_matrix()
+
+
+def pose_to_dual_quaternion(pose):
+    """
+    Convert KITTI pose (4x4 transformation matrix) to dual quaternion (7 elements).
+    
+    Args:
+        pose: 4x4 transformation matrix
+        
+    Returns:
+        dual_quat: 7-element array [qw, qx, qy, qz, tx, ty, tz]
+    """
+    # Extract rotation matrix and translation
+    R = pose[:3, :3]
+    t = pose[:3, 3]
+    
+    # Convert rotation matrix to quaternion
+    q = matrix_to_quaternion(R)  # [qw, qx, qy, qz]
+    
+    # For dual quaternion, we need to represent translation as a quaternion
+    # The standard representation is: [qw, qx, qy, qz, tx, ty, tz]
+    # where qw, qx, qy, qz are the rotation quaternion
+    # and tx, ty, tz are the translation components
+    
+    # However, for a proper dual quaternion representation, we need to combine
+    # rotation and translation into a dual quaternion. The common approach is:
+    # dq = q + 0.5 * ε * t * q
+    # where ε is the dual unit (ε² = 0)
+    
+    # For simplicity, we'll use a 7-element representation:
+    # [qw, qx, qy, qz, tx, ty, tz]
+    # where the first 4 elements are the rotation quaternion
+    # and the last 3 elements are the translation
+    
+    dual_quat = np.concatenate([q, t])
+    return dual_quat
+
+
+def dual_quaternion_to_pose(dual_quat):
+    """
+    Convert dual quaternion (7 elements) to KITTI pose (4x4 transformation matrix).
+    
+    Args:
+        dual_quat: 7-element array [qw, qx, qy, qz, tx, ty, tz]
+        
+    Returns:
+        pose: 4x4 transformation matrix
+    """
+    # Extract rotation quaternion and translation
+    q = dual_quat[:4]  # [qw, qx, qy, qz]
+    t = dual_quat[4:]  # [tx, ty, tz]
+    
+    # Convert quaternion to rotation matrix
+    R = quaternion_to_matrix(q)
+    
+    # Construct 4x4 transformation matrix
+    pose = np.eye(4)
+    pose[:3, :3] = R
+    pose[:3, 3] = t
+    
+    return pose
+
+
+def quaternion_to_euler(q):
+    """
+    Convert quaternion to Euler angles (ZYX).
+    
+    Args:
+        q: [qw, qx, qy, qz] (scalar first)
+        
+    Returns:
+        angles: [z, y, x] in radians
+    """
+    # Convert from [w, x, y, z] to [x, y, z, w]
+    quat = np.array([q[1], q[2], q[3], q[0]])
+    rot = Rotation.from_quat(quat)
+    # Get Euler angles in ZYX order
+    euler = rot.as_euler('zyx', degrees=False)
+    return euler  # [z, y, x]
+
+
+def euler_to_quaternion(angles):
+    """
+    Convert Euler angles (ZYX) to quaternion.
+    
+    Args:
+        angles: [z, y, x] in radians
+        
+    Returns:
+        q: [qw, qx, qy, qz] (scalar first)
+    """
+    # Convert Euler angles to rotation matrix
+    R = euler_to_rotation(angles[0], angles[1], angles[2], seq='zyx')
+    # Convert rotation matrix to quaternion
+    return matrix_to_quaternion(R)
+
+
+def quaternion_loss(pred_quat, target_quat):
+    """
+    Compute quaternion loss between predicted and target quaternions.
+    
+    Args:
+        pred_quat: predicted quaternion [qw, qx, qy, qz]
+        target_quat: target quaternion [qw, qx, qy, qz]
+        
+    Returns:
+        loss: quaternion loss
+    """
+    # Ensure unit quaternions
+    pred_quat = pred_quat / torch.norm(pred_quat, dim=-1, keepdim=True)
+    target_quat = target_quat / torch.norm(target_quat, dim=-1, keepdim=True)
+    
+    # Compute dot product
+    dot = torch.sum(pred_quat * target_quat, dim=-1)
+    
+    # Ensure dot product is in [-1, 1]
+    dot = torch.clamp(dot, -1.0, 1.0)
+    
+    # Compute angular distance
+    angle = 2 * torch.acos(torch.abs(dot))
+    
+    # Return squared angular distance
+    return angle ** 2
+
+
+def dual_quaternion_loss(pred_dq, target_dq):
+    """
+    Compute dual quaternion loss between predicted and target dual quaternions.
+    
+    Args:
+        pred_dq: predicted dual quaternion [qw, qx, qy, qz, tx, ty, tz]
+        target_dq: target dual quaternion [qw, qx, qy, qz, tx, ty, tz]
+        
+    Returns:
+        loss: dual quaternion loss
+    """
+    # Extract rotation quaternions and translations
+    pred_q = pred_dq[:, :4]
+    target_q = target_dq[:, :4]
+    pred_t = pred_dq[:, 4:]
+    target_t = target_dq[:, 4:]
+    
+    # Compute quaternion loss for rotation
+    rot_loss = quaternion_loss(pred_q, target_q)
+    
+    # Compute translation loss (MSE)
+    trans_loss = torch.mean((pred_t - target_t) ** 2, dim=-1)
+    
+    # Combine losses
+    total_loss = rot_loss + trans_loss
+    
+    return total_loss
+
+
+def kitti_pose_to_dual_quaternion(pose):
+    """
+    Convert KITTI pose (12-element array) to dual quaternion (7 elements).
+    
+    Args:
+        pose: 12-element array representing 3x4 transformation matrix
+        
+    Returns:
+        dual_quat: 7-element array [qw, qx, qy, qz, tx, ty, tz]
+    """
+    # Reshape to 4x4 matrix
+    pose_matrix = np.vstack([np.reshape(pose, (3, 4)), [[0.0, 0.0, 0.0, 1.0]]])
+    return pose_to_dual_quaternion(pose_matrix)
+
+
+def dual_quaternion_to_kitti_pose(dual_quat):
+    """
+    Convert dual quaternion (7 elements) to KITTI pose (12-element array).
+    
+    Args:
+        dual_quat: 7-element array [qw, qx, qy, qz, tx, ty, tz]
+        
+    Returns:
+        pose: 12-element array representing 3x4 transformation matrix
+    """
+    pose_matrix = dual_quaternion_to_pose(dual_quat)
+    # Extract 3x4 transformation matrix
+    return pose_matrix[:3, :4].flatten()

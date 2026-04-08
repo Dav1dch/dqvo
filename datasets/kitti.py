@@ -36,7 +36,7 @@ class KITTI(torch.utils.data.Dataset):
         gt_path=r"data/poses",
         camera_id="2",
         sequences=["00", "02", "08", "09"],
-        # sequences=["00"],
+        # sequences=["09"],
         window_size=3,
         overlap=1,
         read_poses=True,

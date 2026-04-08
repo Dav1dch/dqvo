@@ -11,7 +11,7 @@ import tqdm
 from PIL import Image
 from torchvision import transforms
 
-from datasets.utils import extract_fp, rotation_to_euler
+from datasets.utils import extract_fp, rotation_to_euler, kitti_pose_to_dual_quaternion, dual_quaternion_to_kitti_pose
 
 
 def pixel2cam(pt, fx, fy, cx, cy):
@@ -20,30 +20,28 @@ def pixel2cam(pt, fx, fy, cx, cy):
     return pt
 
 
-class Euroc(torch.utils.data.Dataset):
+class KITTI(torch.utils.data.Dataset):
     """
-    Euroc datasets
+    Dataloader for KITTI Visual Odometry Dataset
+        http://www.cvlibs.net/datasets/kitti/eval_odometry.php
+
+    Arguments:
+        data_path {str}: path to data sequences
+        gt_path {str}: path to poses
     """
 
     def __init__(
         self,
-        data_path=r"Euroc/sequences_jpg",
-        gt_path=r"Euroc/poses",
-        camera_id="cam2",
-        sequences=[
-            "MH_01_easy",
-            "MH_02_easy",
-            "MH_03_medium",
-            "V1_01_easy",
-            "V1_02_medium",
-            "V2_01_easy",
-        ],
-        # sequences=["00"],
+        data_path=r"data/sequences_jpg",
+        gt_path=r"data/poses",
+        camera_id="2",
+        sequences=["00", "02", "08", "09"],
         window_size=3,
         overlap=1,
         read_poses=True,
         transform=None,
         train=False,
+        frame_skip=0,
     ):
 
         self.data_path = data_path
@@ -54,25 +52,14 @@ class Euroc(torch.utils.data.Dataset):
         self.window_size = window_size
         self.overlap = overlap
         self.transform = transform
+        self.frame_skip = frame_skip
 
         self.train = train
         # KITTI normalization
-        # self.mean_angles = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
-        # self.std_angles = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
-        # self.mean_t = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
-        # self.std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
-        self.mean_t = np.array(
-            [-0.002397877045584663, -0.0024458572093878886, 0.004888460471049203]
-        )
-        self.std_t = np.array(
-            [0.02901514230062158, 0.014839373072005968, 0.024481462506728474]
-        )
-        self.mean_angles = np.array(
-            [-0.0002168584079364202, -0.0007101462156302978, 0.00019981204840242552]
-        )
-        self.std_angles = np.array(
-            [0.009480167564552545, 0.014328730421565414, 0.012684338416658968]
-        )
+        self.mean_angles = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+        self.std_angles = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+        self.mean_t = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+        self.std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
 
         # define sequence for training, test and val
         self.sequences = sequences
@@ -88,9 +75,43 @@ class Euroc(torch.utils.data.Dataset):
         data["frames"] = frames
         data["sequence"] = seqs
         self.data = data
-        # self.read_intrinsics_param()
+        self.read_intrinsics_param()
         # print(self.cam_params)
         self.windowed_data = self.create_windowed_dataframe(data)
+        if not os.path.exists("fp.pickle"):
+            self.generate_fp()
+        self.fp = None
+        with open("fp.pickle", "rb") as p:
+            self.fp = pickle.load(p)
+
+    def generate_fp(self):
+        import time
+        id_dict = {}
+        unique_w_idx = self.windowed_data["w_idx"].unique()
+        print(f"Generating feature points for {len(unique_w_idx)} windows...")
+        
+        for i in tqdm.tqdm(unique_w_idx):
+            fp_dict = {}
+            data = self.windowed_data.loc[self.windowed_data["w_idx"] == i]
+            frame = data["frames"].values
+            cvimage1 = cv2.imread(frame[0], cv2.IMREAD_GRAYSCALE)
+            cvimage2 = cv2.imread(frame[1], cv2.IMREAD_GRAYSCALE)
+            
+            if cvimage1 is None or cvimage2 is None:
+                fp_dict["pt1"] = np.array([])
+                fp_dict["pt2"] = np.array([])
+                id_dict[i] = fp_dict
+                continue
+            
+            pt1, pt2 = extract_fp(cvimage1, cvimage2)
+            
+            fp_dict["pt1"] = pt1
+            fp_dict["pt2"] = pt2
+            id_dict[i] = fp_dict
+        
+        with open("fp.pickle", "wb") as p:
+            pickle.dump(id_dict, p, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Feature points saved to fp.pickle")
 
     def __len__(self):
         return len(self.windowed_data["w_idx"].unique())
@@ -104,6 +125,10 @@ class Euroc(torch.utils.data.Dataset):
         """
         # get data of corresponding window index
         data = self.windowed_data.loc[self.windowed_data["w_idx"] == idx, :]
+
+        # fp = self.fp[idx]
+        # pt1 = fp["pt1"]
+        # pt2 = fp["pt2"]
 
         # Read frames as grayscale
         frames = data["frames"].values
@@ -119,18 +144,15 @@ class Euroc(torch.utils.data.Dataset):
         # T C H W -> C T H W.
         imgs = imgs.transpose(1, 0, 2, 3)
 
-        # Read ground truth [window_size-1 x 6]
+        # Read ground truth [window_size-1 x 12]
         gt_poses = data.loc[:, [i for i in range(12)]].values
         global_pose = gt_poses[-1]
         global_pose = np.vstack(
             [np.reshape(global_pose, (3, 4)), [[0.0, 0.0, 0.0, 1.0]]]
         )
-        R = global_pose[:3, :3]
-        t = global_pose[:3, 3]
-        angles = rotation_to_euler(R, seq="zyx")
-        # angles = (np.asarray(angles) - self.mean_angles) / self.std_angles
-        # t = (np.asarray(t) - self.mean_t) / self.std_t
-        global_pose = list(angles) + list(t)
+        # Convert global pose to dual quaternion (7 elements)
+        global_dual_quat = kitti_pose_to_dual_quaternion(global_pose.flatten()[:12])
+        
         y = []
         for gt_idx, gt in enumerate(gt_poses):
 
@@ -140,29 +162,65 @@ class Euroc(torch.utils.data.Dataset):
             # compute relative pose from frame1 to frame2
             if gt_idx > 0:
                 pose_wrt_prev = np.dot(np.linalg.inv(pose_prev), pose)
-                R = pose_wrt_prev[:3, :3]
-                t = pose_wrt_prev[:3, 3]
-
-                # Euler parameterization (rotations as Euler angles)
-                angles = rotation_to_euler(R, seq="zyx")
-
-                # normalization
-                angles = (np.asarray(angles) - self.mean_angles) / self.std_angles
+                
+                # Convert relative pose to dual quaternion (7 elements)
+                dual_quat = kitti_pose_to_dual_quaternion(pose_wrt_prev.flatten()[:12])
+                
+                # For now, we'll keep the normalization for translation
+                # but we need to think about how to normalize dual quaternions
+                # For simplicity, we'll normalize the translation part
+                t = dual_quat[4:]  # translation components
                 t = (np.asarray(t) - self.mean_t) / self.std_t
-
-                # concatenate angles and translation
-                y.append(list(angles) + list(t))
+                
+                # Combine normalized translation with rotation quaternion
+                # Note: We're not normalizing the rotation quaternion part
+                y.append(list(dual_quat[:4]) + list(t))
 
             pose_prev = pose
 
         y = np.asarray(y)  # discard first value
         # y = y.flatten()
-        global_pose = np.asarray(global_pose)
+        global_pose = np.asarray(global_dual_quat)
 
-        pt1 = torch.Tensor([])
-        pt2 = torch.Tensor([])
+        fp = self.fp[idx]
+        pt1 = fp["pt1"]
+        pt2 = fp["pt2"]
+        
+        max_fp = 100
+        
+        if isinstance(pt1, np.ndarray):
+            pt1 = torch.from_numpy(pt1).float()
+        if isinstance(pt2, np.ndarray):
+            pt2 = torch.from_numpy(pt2).float()
+        
+        if not isinstance(pt1, torch.Tensor):
+            pt1 = torch.tensor(pt1).float()
+        if not isinstance(pt2, torch.Tensor):
+            pt2 = torch.tensor(pt2).float()
+        
+        if pt1.numel() == 0:
+            pt1 = torch.zeros(0, 2)
+        if pt2.numel() == 0:
+            pt2 = torch.zeros(0, 2)
+        
+        n1 = pt1.shape[0] if pt1.dim() > 0 else 0
+        n2 = pt2.shape[0] if pt2.dim() > 0 else 0
+        
+        n_valid = min(n1, n2) if n1 > 0 and n2 > 0 else 0
+        
+        if n1 < max_fp:
+            pad1 = torch.zeros(max_fp - n1, 2)
+            pt1 = torch.cat([pt1, pad1], dim=0) if n1 > 0 else pad1
+        elif n1 > max_fp:
+            pt1 = pt1[:max_fp]
+        
+        if n2 < max_fp:
+            pad2 = torch.zeros(max_fp - n2, 2)
+            pt2 = torch.cat([pt2, pad2], dim=0) if n2 > 0 else pad2
+        elif n2 > max_fp:
+            pt2 = pt2[:max_fp]
 
-        return imgs, pt1, pt2, y
+        return imgs, pt1, pt2, y, n_valid
 
     def read_intrinsics_param(self):
         """
@@ -196,7 +254,7 @@ class Euroc(torch.utils.data.Dataset):
         seqs = []
         for sequence in self.sequences:
             frames_dir = os.path.join(
-                self.data_path, sequence, "{}".format(self.camera_id), "*.png"
+                self.data_path, sequence, "image_{}".format(self.camera_id), "*.png"
             )
             frames_seq = sorted(glob.glob(frames_dir))
             frames = frames + frames_seq
@@ -225,16 +283,19 @@ class Euroc(torch.utils.data.Dataset):
     def create_windowed_dataframe(self, df):
         window_size = self.window_size
         overlap = self.overlap
+        frame_skip = self.frame_skip
         windowed_df = pd.DataFrame()
         w_idx = 0
 
         for sequence in df["sequence"].unique():
             seq_df = df.loc[df["sequence"] == sequence, :].reset_index(drop=True)
             row_idx = 0
-            while row_idx + window_size <= len(seq_df):
+            step = (window_size - 1) * (frame_skip + 1) + 1
+            while row_idx + step <= len(seq_df):
 
-                rows = seq_df.iloc[row_idx : (row_idx + window_size)].copy()
-                rows["w_idx"] = len(rows) * [w_idx]  # add window index column
+                frame_indices = [row_idx + i * (frame_skip + 1) for i in range(window_size)]
+                rows = seq_df.iloc[frame_indices].copy()
+                rows["w_idx"] = len(rows) * [w_idx]
                 row_idx = row_idx + window_size - overlap
                 w_idx = w_idx + 1
                 windowed_df = pd.concat([windowed_df, rows], ignore_index=True)

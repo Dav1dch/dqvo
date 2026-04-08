@@ -48,6 +48,11 @@ class PatchEmbedMamba(nn.Module):
         self.num_patches = self.grid_size[0] * self.grid_size[1]  # 总共的patch个数
         self.flatten = flatten
         # 打patch的操作，实际为卷积的操作(为了不重复卷积，步长的大小理论上因该等于卷积核的大小）
+        # self.proj = nn.Sequential(
+        #     nn.InstanceNorm2d(3, affine=True),
+        #     nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=stride),
+        # )
+
         self.proj = nn.Conv2d(
             in_channels, embed_dim, kernel_size=patch_size, stride=stride
         )
@@ -91,106 +96,14 @@ class PatchEmbedMamba(nn.Module):
             )  # B,embed_dim,grid_size,grid_size——>B,embed_dim,grid_size*grid_size——>B,grid_size*grid_size,embed_dim
         x = self.norm(x)
         x = x.reshape(B * self.grid_size[0] * self.grid_size[1], L, -1)
-        residule = None
-        for layer in self.layers:
-            x, residule = layer(x, residule)
-        x = x[:, 1:].reshape(B * (L - 1), self.grid_size[0] * self.grid_size[1], -1)
-        return x
+        # residule = None
+        # for layer in self.layers:
+        #     x, residule = layer(x, residule)
+        unfolded = x.unfold(dimension=1, size=2, step=1)  # 形状: (4704, 2, 192, 2)
 
-
-class PatchEmbedCross(nn.Module):
-    def __init__(
-        self,
-        img_size=(224, 224),
-        patch_size=16,
-        stride=16,
-        in_channels=3,
-        embed_dim=768,
-        norm_layer=None,
-        flatten=True,
-    ):
-        super(PatchEmbedCross, self).__init__()
-        # img_size = to_2tuple(img_size)
-        # img_size = (608, 192)
-        patch_size = to_2tuple(patch_size)  # 将img_size和patch_size化成元组的形式
-        self.img_size = img_size
-        self.patch_size = patch_size
-        # 一个patch形成一个grid（网格），这里记录网格的形状
-        self.grid_size = (
-            (img_size[0] - patch_size[0]) // stride + 1,
-            (img_size[1] - patch_size[1]) // stride + 1,
-        )
-        self.num_patches = self.grid_size[0] * self.grid_size[1]  # 总共的patch个数
-        self.flatten = flatten
-        # 打patch的操作，实际为卷积的操作(为了不重复卷积，步长的大小理论上因该等于卷积核的大小）
-        self.proj = nn.Conv3d(
-            in_channels,
-            embed_dim,
-            kernel_size=(2, *patch_size),
-            stride=(2, stride, stride),
-            # padding=(1, 0),
-            # dilation=(1, 0),
-        )
-        self.norm = (
-            norm_layer(embed_dim) if norm_layer else nn.Identity()
-        )  # nn.Identity的输入等于输出，通常作为占位层使用
-
-    def forward(self, x):
-        B, C, D, H, W = x.shape
-        assert (
-            H == self.img_size[0] and W == self.img_size[1]
-        ), f"Input img size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})"
-        x = self.proj(x)  # B,C,H,W——>B,embed_dim,grid_size,grid_size
-        if self.flatten:
-            x = x.flatten(2).transpose(
-                1, 2
-            )  # B,embed_dim,grid_size,grid_size——>B,embed_dim,grid_size*grid_size——>B,grid_size*grid_size,embed_dim
-        x = self.norm(x)
-        return x
-
-
-class PatchEmbed(nn.Module):
-    def __init__(
-        self,
-        img_size=224,
-        patch_size=16,
-        stride=16,
-        in_channels=3,
-        embed_dim=768,
-        norm_layer=None,
-        flatten=True,
-    ):
-        super(PatchEmbed, self).__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)  # 将img_size和patch_size化成元组的形式
-        self.img_size = img_size
-        self.patch_size = patch_size
-        # 一个patch形成一个grid（网格），这里记录网格的形状
-        self.grid_size = (
-            (img_size[0] - patch_size[0]) // stride + 1,
-            (img_size[1] - patch_size[1]) // stride + 1,
-        )
-        self.num_patches = self.grid_size[0] * self.grid_size[1]  # 总共的patch个数
-        self.flatten = flatten
-        # 打patch的操作，实际为卷积的操作(为了不重复卷积，步长的大小理论上因该等于卷积核的大小）
-        self.proj = nn.Conv2d(
-            in_channels, embed_dim, kernel_size=patch_size, stride=stride
-        )
-        self.norm = (
-            norm_layer(embed_dim) if norm_layer else nn.Identity()
-        )  # nn.Identity的输入等于输出，通常作为占位层使用
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        assert (
-            H == self.img_size[0] and W == self.img_size[1]
-        ), f"Input img size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})"
-        x = self.proj(x)  # B,C,H,W——>B,embed_dim,grid_size,grid_size
-        if self.flatten:
-            x = x.flatten(2).transpose(
-                1, 2
-            )  # B,embed_dim,grid_size,grid_size——>B,embed_dim,grid_size*grid_size——>B,grid_size*grid_size,embed_dim
-        x = self.norm(x)
+        # 对最后一个维度求平均，然后调整维度
+        x = unfolded.mean(dim=-1)  # 形状: (4704, 2, 192)
+        x = x.reshape(B * (L - 1), self.grid_size[0] * self.grid_size[1], -1)
         return x
 
 
@@ -322,7 +235,7 @@ class CrossVisionMamba(nn.Module):
         num_classes=1000,  # 这里用imagenet做分类任务所以有1000个类，也就代表了最后的mlp的输出层包含1000个节点
         ssm_cfg=None,  # ssm的配置文件
         drop_rate=0.0,  # drop_rate是针对于dropout的频率（对某个节点进行失活的操作）
-        drop_path_rate=0.2,  # drop_path_rate是针对drop_path的频率（对某个层进行失活的操作）
+        drop_path_rate=0.4,  # drop_path_rate是针对drop_path的频率（对某个层进行失活的操作）
         norm_epsilon: float = 1e-5,
         rms_norm: bool = False,  # 是否使用rms_norm这种方法
         fused_add_norm=False,

@@ -13,14 +13,14 @@ from datasets.kitti import KITTI
 
 from timesformer.models.vit import VisionTransformer
 from timesformer.models.vit_seq import CrossViT
-from timesformer.models.mamba import CrossVisionMamba
+from timesformer.models.mamba_octo import CrossVisionMamba
 
-checkpoint_path = "checkpoints/Exp36"
-checkpoint_name = "checkpoint_best"
-# sequences = ['00',"01", '02',"03", "04", "05", "06", "07", '08', '09', "10"]
+checkpoint_path = "checkpoints/Exp53_tri"
+checkpoint_name = "checkpoint_last"
 sequences = ["01", "03", "04", "05", "06", "07", "10"]
-# sequences = ["07"]
-# sequences = ["03", "07"]
+
+# sequences = ["06", "07", "09", "10"]
+# sequences = ["00"]
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -30,7 +30,6 @@ with open(os.path.join(checkpoint_path, "args.pkl"), "rb") as f:
 f.close()
 model_params = args["model_params"]
 args["checkpoint_path"] = checkpoint_path
-print(args)
 
 # preprocessing operation
 preprocess = transforms.Compose(
@@ -43,24 +42,27 @@ preprocess = transforms.Compose(
         ),
     ]
 )
+args["num_frames"] = 3
+args["overlap"] = 2
+print(args)
 
 # build and load model
-model = VisionTransformer(
-    img_size=model_params["image_size"],
-    num_classes=model_params["num_classes"],
-    patch_size=model_params["patch_size"],
-    embed_dim=model_params["dim"],
-    depth=model_params["depth"],
-    num_heads=model_params["heads"],
-    mlp_ratio=4,
-    qkv_bias=True,
-    norm_layer=partial(nn.LayerNorm, eps=1e-6),
-    drop_rate=0.0,
-    attn_drop_rate=0.0,
-    drop_path_rate=0.1,
-    num_frames=model_params["num_frames"],
-    attention_type=model_params["attention_type"],
-)
+# model = VisionTransformer(
+#     img_size=model_params["image_size"],
+#     num_classes=model_params["num_classes"],
+#     patch_size=model_params["patch_size"],
+#     embed_dim=model_params["dim"],
+#     depth=model_params["depth"],
+#     num_heads=model_params["heads"],
+#     mlp_ratio=4,
+#     qkv_bias=True,
+#     norm_layer=partial(nn.LayerNorm, eps=1e-6),
+#     drop_rate=0.0,
+#     attn_drop_rate=0.0,
+#     drop_path_rate=0.1,
+#     num_frames=model_params["num_frames"],
+#     attention_type=model_params["attention_type"],
+# )
 
 
 # model = CrossViT(
@@ -74,26 +76,28 @@ model = VisionTransformer(
 #     mlp_dim=1024,
 # )
 
-# model = CrossVisionMamba(
-#     image_height=model_params["image_size"][0],
-#     image_width=model_params["image_size"][1],
-#     patch_size=model_params["patch_size"],
-#     num_classes=1000,
-#     # patch_size=16,
-#     embed_dim=192,
-#     depth=model_params["depth"],
-#     rms_norm=True,
-#     residual_in_fp32=True,
-#     fused_add_norm=True,
-#     final_pool_type="mean",
-#     if_abs_pos_embed=True,
-#     if_rope=False,
-#     if_rope_residual=False,
-#     bimamba_type="V2",
-#     if_cls_token=False,
-#     use_double_cls_token=False,
-# )
+model = CrossVisionMamba(
+    image_height=model_params["image_size"][0],
+    image_width=model_params["image_size"][1],
+    patch_size=model_params["patch_size"],
+    num_classes=1000,
+    embed_dim=192,
+    depth=model_params["depth"],
+    # depth=24,
+    rms_norm=True,
+    residual_in_fp32=True,
+    fused_add_norm=True,
+    final_pool_type="mean",
+    if_abs_pos_embed=True,
+    if_rope=False,
+    if_rope_residual=False,
+    bimamba_type="V2",
+    if_cls_token=False,
+    use_double_cls_token=False,
+)
 
+n = sum([param.nelement() for param in model.parameters()])
+print(n)
 
 checkpoint = torch.load(
     os.path.join(args["checkpoint_path"], "{}.pth".format(checkpoint_name)),
@@ -101,12 +105,10 @@ checkpoint = torch.load(
     weights_only=True,
 )
 print(args["checkpoint_path"])
-model.load_state_dict(checkpoint["model_state_dict"])
+model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 if torch.cuda.is_available():
     model.cuda()
 
-args["window_size"] = 3
-args["overlap"] = 2
 
 for sequence in sequences:
     # test dataloader
@@ -126,9 +128,13 @@ for sequence in sequences:
     )
 
     with tqdm(test_loader, unit="batch") as batchs:
-        pred_poses = np.zeros((1, args["window_size"] - 1, 6))
+        # Check if we're using dual quaternion representation
+        use_dual_quaternion = args.get("use_dual_quaternion", False)
+        output_dim = 7 if use_dual_quaternion else 6
+
+        pred_poses = np.zeros((1, args["window_size"] - 1, output_dim))
         batchs.set_description(f"Sequence {sequence}")
-        for images, pt1, pt2, gt in batchs:
+        for images, pt1, pt2, gt, n in batchs:
             if torch.cuda.is_available():
                 images, gt = images.cuda(), gt.cuda()
 
@@ -142,7 +148,8 @@ for sequence in sequences:
                     # predict pose
                     pred_pose = model(images.float()).cpu().detach().numpy()
                     pred_pose = np.reshape(
-                        pred_pose, (images.shape[0], args["window_size"] - 1, 6)
+                        pred_pose,
+                        (images.shape[0], args["window_size"] - 1, output_dim),
                     )
                     # pred_pose = np.expand_dims(pred_pose,axis=0)
                     pred_poses = np.concatenate((pred_poses, pred_pose), axis=0)

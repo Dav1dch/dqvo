@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from datasets.kitti import KITTI
-from datasets.utils import euler_to_rotation
+from datasets.utils import euler_to_rotation, dual_quaternion_to_pose
 
 import matplotlib
 
@@ -99,15 +99,22 @@ def post_processing(pred_poses, args):
     return np.asarray(poses)
 
 
-def recover_trajectory_and_poses(poses, norm):
+def recover_trajectory_and_poses(poses, norm, use_dual_quaternion=False):
+
+    if use_dual_quaternion:
+        return recover_trajectory_and_poses_dual_quaternion(poses, norm)
+    else:
+        return recover_trajectory_and_poses_euler(poses, norm)
+
+
+def recover_trajectory_and_poses_euler(poses, norm):
 
     predicted_poses = []
     # recover predicted trajectory
     predicted_trajectory = []
-    for i in range(len(poses) - 1):
-        if i == 0:
-            T = np.eye(4)
+    T = np.eye(4)  # Initialize T at the start
 
+    for i in range(len(poses) - 1):
         angles = poses[i, :3]
         t = poses[i, 3:]
 
@@ -116,6 +123,16 @@ def recover_trajectory_and_poses(poses, norm):
         std_angles = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
         mean_t = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
         std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
+        # mean_t = np.array(
+        #     [0.0013561882415943965, 0.0020733994642250808, -0.00014500151678821502]
+        # )
+        # std_t = np.array([0.17138581278908738, 0.18442089670966283, 0.097886895944611])
+        # mean_angles = np.array(
+        #     [-1.27889350370224e-05, -0.00016774727133543198, -8.898331117560475e-05]
+        # )
+        # std_angles = np.array(
+        #     [0.018866636090010627, 0.013954030128821779, 0.012936541020268352]
+        # )
         [x, y, z] = angles
 
         if norm:
@@ -139,14 +156,64 @@ def recover_trajectory_and_poses(poses, norm):
     return predicted_poses, predicted_trajectory
 
 
+def recover_trajectory_and_poses_dual_quaternion(poses, norm):
+    """
+    Recover trajectory and poses from dual quaternion representation.
+
+    Args:
+        poses: array of shape (N, 7) where each row is [qw, qx, qy, qz, tx, ty, tz]
+        norm: whether to undo normalization
+
+    Returns:
+        predicted_poses: list of 4x4 transformation matrices
+        predicted_trajectory: list of translation vectors
+    """
+    predicted_poses = []
+    predicted_trajectory = []
+
+    # Undo normalization for translation
+    mean_t = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
+
+    T = np.eye(4)  # Initialize T at the start
+
+    for i in range(len(poses) - 1):
+        # Extract dual quaternion components
+        dq = poses[i, :]  # [qw, qx, qy, qz, tx, ty, tz]
+
+        # Extract rotation quaternion and translation
+        q = dq[:4]  # rotation quaternion
+        t = dq[4:]  # translation
+
+        # Undo normalization for translation
+        if norm:
+            t = np.multiply(t, std_t) + mean_t
+
+        # Create dual quaternion with normalized translation
+        dq_normalized = np.concatenate([q, t])
+
+        # Convert dual quaternion to 4x4 transformation matrix
+        T_r = dual_quaternion_to_pose(dq_normalized)
+
+        # Compose transformation
+        T_abs = np.dot(T, T_r)
+        T = T_abs
+
+        predicted_poses.append(T)
+        predicted_trajectory.append(T_abs[:3, 3])
+
+    return predicted_poses, predicted_trajectory
+
+
 if __name__ == "__main__":
 
-    ckpt_path = "checkpoints/Exp36/"
-    ckpt_name = "checkpoint_best"
+    ckpt_path = "checkpoints/Exp53_tri/"
+    ckpt_name = "checkpoint_last"
     sequences = ["01", "03", "04", "05", "06", "07", "10"]
     # sequences = ['00',"01",'02', "03", "04", "05", "06", "07", '08', '09',"10"]
     # sequences = ["03", "07"]
-    # sequences = ["07"]
+    # sequences = ["00"]
+    # sequences = ["06", "07", "09", "10"]
 
     # read hyperparameters and configuration
     with open(os.path.join(ckpt_path, "args.pkl"), "rb") as f:
@@ -173,7 +240,12 @@ if __name__ == "__main__":
         # post processing and recover trajectory
         poses = post_processing(pred_poses, args)
         # poses_TS = post_processing(pred_TS_poses, args)
-        pred_poses, pred_trajectory = recover_trajectory_and_poses(poses, True)
+
+        # Check if we're using dual quaternion representation
+        use_dual_quaternion = args.get("use_dual_quaternion", False)
+        pred_poses, pred_trajectory = recover_trajectory_and_poses(
+            poses, True, use_dual_quaternion
+        )
         # pred_TS_poses, pred_TS_trajectory = recover_trajectory_and_poses(poses_TS, True)
 
         save_trajectory(

@@ -607,8 +607,9 @@ class VisionTransformer(nn.Module):
     def forward(self, x):
         b, c, l, h, w = x.shape
         x = self.forward_features(x)
-        x = self.head(x).view(b, l - 1, -1)
-        return x
+        x = self.head(x)
+        # x = self.head(x).view(b, l - 1, -1)
+        return x.view(b, l - 1, -1)
 
 
 def _conv_filter(state_dict, patch_size=16):
