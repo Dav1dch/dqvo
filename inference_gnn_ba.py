@@ -96,7 +96,7 @@ def plot_trajectories(gt_poses, initial_poses, optimized_poses, save_path):
 
 
 def predict_sequence_simple(
-    vo_model, gnn_model, dataset, args, device, delta_scale=0.1
+    vo_model, gnn_model, dataset, args, device
 ):
     """
     Inference using GNN-BA with proper post-processing of relative poses.
@@ -104,10 +104,6 @@ def predict_sequence_simple(
     The GNN delta is applied to VO absolute poses to get optimized absolute poses.
     Then relative poses are computed, normalized, and merged across overlapping windows
     to produce a smooth continuous trajectory.
-
-    Args:
-        delta_scale: Scaling factor for GNN delta. Default 0.1 means only 10% of predicted
-                     delta is applied. This compensates for poorly trained models.
     """
     gnn_model.eval()
     vo_model.eval()
@@ -141,7 +137,7 @@ def predict_sequence_simple(
     print(f"VO trajectory: {len(vo_poses)} poses")
 
     # Step 2: Run GNN on each window, collect optimized relative poses
-    print(f"\nStep 2: Running GNN optimization (delta_scale={delta_scale})...")
+    print("\nStep 2: Running GNN optimization...")
     opt_relative_poses_list = []
     delta_norms = []
 
@@ -203,10 +199,10 @@ def predict_sequence_simple(
                 with torch.no_grad():
                     camera_delta, _ = gnn_model(data, return_delta=True)
                 camera_delta_np = camera_delta.cpu().numpy()
-                delta_norms.append(np.linalg.norm(delta_scale * camera_delta_np))
+                delta_norms.append(np.linalg.norm(camera_delta_np))
 
                 # Compute optimized absolute poses for this window
-                opt_abs_6dof = abs_poses_6dof + delta_scale * camera_delta_np
+                opt_abs_6dof = abs_poses_6dof + camera_delta_np
 
                 # Convert to 4x4 matrices
                 opt_abs_4x4 = []
@@ -275,12 +271,6 @@ def main():
     parser.add_argument("--window_size", type=int, default=3, help="Window size")
     parser.add_argument(
         "--overlap", type=int, default=2, help="Overlap between windows"
-    )
-    parser.add_argument(
-        "--delta_scale",
-        type=float,
-        default=1.0,
-        help="Scale factor for GNN delta (0.1 = use only 10% of predicted delta)",
     )
     parser.add_argument(
         "--data_path",
@@ -356,7 +346,7 @@ def main():
     # Run inference
     print("\nRunning inference...")
     vo_poses, opt_poses = predict_sequence_simple(
-        vo_model, gnn_model, dataset, args, device, delta_scale=args.delta_scale
+        vo_model, gnn_model, dataset, args, device
     )
 
     # Save poses

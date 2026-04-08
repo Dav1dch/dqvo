@@ -305,7 +305,7 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
             gnn_delta_euler = camera_delta[1:, :3]
             gnn_delta_t = camera_delta[1:, 3:]
             
-            k = args.get("weighted_loss", 1.0)
+            k = args.get("weighted_loss", 100.0)
             loss_angles = k * F.mse_loss(gnn_delta_euler, gt_delta_euler)
             loss_translation = k * F.mse_loss(gnn_delta_t, gt_delta_t)
             # print(loss_angles, loss_translation, valid_errors.mean())
@@ -314,7 +314,7 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
             # ---- Step 8: Backprop and update ----
             if valid_errors.numel() > 0:
                 # Combined loss: reprojection loss + pose loss
-                loss = huber_loss(valid_errors, delta=1.0).mean() * 0.001 + pose_loss
+                loss = huber_loss(valid_errors, delta=1.0).mean() * 0.05 + pose_loss
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(gnn_model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -712,7 +712,7 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     # Post-process and accumulate
     processed_opt_poses = post_processing(opt_relative_poses, window_size, overlap)
     opt_poses_full, opt_trajectory = recover_trajectory_and_poses(
-        processed_opt_poses, norm=False
+        processed_opt_poses, norm=True
     )
     print(f"Recovered {len(opt_poses_full)} optimized absolute poses")
 
@@ -730,12 +730,12 @@ def main():
     parser.add_argument("--sequence", type=str, default="03", help="Sequence number")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--hidden_dim", type=int, default=32, help="Hidden dimension")
-    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--window_size", type=int, default=3, help="Window size")
     parser.add_argument(
         "--overlap", type=int, default=2, help="Overlap between windows"
     )
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument(
         "--data_path",
         type=str,

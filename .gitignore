@@ -8,7 +8,8 @@ __pycache__/
 *.pot
 
 # gnn fp
-gnn_ba_output/
+*.png
+*.pdf
 *.pth
 Exp53/
 
