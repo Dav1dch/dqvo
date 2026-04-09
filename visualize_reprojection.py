@@ -2,16 +2,16 @@
 Visualize feature matching and pose reprojection.
 
 Evaluation protocol:
-1. Triangulate 3D points from frame 1 & 2 (indices 0 & 1) using ORB feature matches and GT poses.
+1. Triangulate 3D points from frame 1 & 3 (indices 0 & 2) using ORB feature matches and GT poses.
 2. Reproject these points to frame 3 (index 2) using:
    - VO pose (before optimization)
-   - GNN pose (after optimization)
+    - GNN pose reconstructed from direct relative-pose predictions
 3. Visualize side-by-side:
    - Left: Frame 2 with matched feature points (from ORB matching between frame 1 & 2)
    - Right: Frame 3 with reprojected points (VO and GNN) compared to observed keypoints
 
 Usage:
-    python visualize_reprojection.py --vo_checkpoint checkpoints/Exp51/checkpoint_best.pth --sequence 03
+    python visualize_reprojection.py --vo_checkpoint checkpoints/Exp51/checkpoint_best.pth --gnn_checkpoint gnn_ba_output/gnn_ba_best.pth --sequence 03
 """
 
 import argparse
@@ -36,7 +36,6 @@ from utils.gnn_ba import (
     build_heterogeneous_graph,
     denormalize_poses,
     euler_to_rotation,
-    poses_to_camera_features,
     triangulate_all_points,
     rotation_to_euler,
 )
@@ -233,7 +232,7 @@ def main():
         "--num_samples", type=int, default=5, help="Number of samples to visualize"
     )
     parser.add_argument(
-        "--hidden_dim", type=int, default=32, help="GNN hidden dimension"
+        "--hidden_dim", type=int, default=128, help="GNN hidden dimension"
     )
     parser.add_argument(
         "--save_dir",
@@ -290,7 +289,7 @@ def main():
     # Load GNN model
     print(f"\nLoading GNN model from: {args.gnn_checkpoint}")
     gnn_model = GNNBAOptimizer(hidden_dim=args.hidden_dim, num_layers=3).to(device)
-    checkpoint = torch.load(args.gnn_checkpoint)
+    checkpoint = torch.load(args.gnn_checkpoint, map_location=device)
     gnn_model.load_state_dict(checkpoint["model_state_dict"])
     gnn_model.eval()
     print(f"GNN model loaded (epoch {checkpoint.get('epoch', '?')})")
@@ -322,9 +321,6 @@ def main():
             continue
 
         # Preprocess images for VO model
-        import cv2
-        from PIL import Image
-
         pil_images = []
         for img in images:
             if len(img.shape) == 2:
@@ -376,7 +372,6 @@ def main():
                 u2, v2 = obs2[1], obs2[2]
 
                 try:
-                    observations = np.array([[u0, v0], [u2, v2]], dtype=np.float64)
                     obs_h = np.array([[u0], [v0]], dtype=np.float64), np.array(
                         [[u2], [v2]], dtype=np.float64
                     )
@@ -398,17 +393,18 @@ def main():
 
         points_3d_gt = np.array(points_3d_gt, dtype=np.float32)
 
-        # === Step 2: Get optimized poses from GNN ===
+        # === Step 2: Get optimized poses from GNN direct relative predictions ===
         # Triangulate using VO for GNN input (as in training)
         points_vo, graph_obs_vo = triangulate_all_points(tracks, vo_poses, K)
         if len(points_vo) < 10:
             continue
 
         # Build graph from VO triangulation
-        data = build_heterogeneous_graph(3, points_vo, graph_obs_vo, 224, 672)
+        img_height, img_width = images[0].shape[:2]
+        data = build_heterogeneous_graph(3, points_vo, graph_obs_vo, img_height, img_width)
 
-        # Use accumulated absolute poses as GNN input (like validate)
-        # vo_poses is already accumulated 4x4 absolute poses
+        # Use accumulated absolute VO poses as GNN camera-node input.
+        # The model predicts relative poses between consecutive frames.
         abs_poses_6dof = []
         for pose in vo_poses:
             if isinstance(pose, torch.Tensor):
@@ -424,22 +420,21 @@ def main():
         data = data.to(device)
 
         with torch.no_grad():
-            camera_refined, point_refined = gnn_model(data, return_delta=False)
-        print(camera_refined)
+            pred_rel_poses, _ = gnn_model(data, output_mode="relative")
 
-        # GNN returns refined poses directly (input + delta)
-        opt_camera_np = camera_refined.cpu().numpy()
-        euler = opt_camera_np[:, :3]
-        t = opt_camera_np[:, 3:]
+        # Compose optimized absolute poses from direct relative outputs.
+        pred_rel_np = pred_rel_poses.detach().cpu().numpy()  # (window_size-1, 6)
+        first_pose = vo_poses[0]
+        if isinstance(first_pose, torch.Tensor):
+            first_pose = first_pose.cpu().numpy()
 
-        # Convert to 4x4 pose matrices
-        opt_poses = []
-        for i in range(3):
-            R = euler_to_rotation(euler[i], seq="zyx")
-            pose = np.eye(4)
-            pose[:3, :3] = R
-            pose[:3, 3] = t[i]
-            opt_poses.append(pose)
+        opt_poses = [first_pose.copy()]
+        for rel_pose in pred_rel_np:
+            R_rel = euler_to_rotation(rel_pose[:3], seq="zyx")
+            T_rel = np.eye(4)
+            T_rel[:3, :3] = R_rel
+            T_rel[:3, 3] = rel_pose[3:]
+            opt_poses.append(opt_poses[-1] @ T_rel)
 
         # === Step 3: Compute reprojection errors on frame 2 (index 2) ===
         K_matrix = np.array(

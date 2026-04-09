@@ -1,11 +1,8 @@
 """
 Simple inference script for GNN-based Bundle Adjustment.
 
-This script loads a trained GNN model and applies it to refine VO poses.
-The key insight is that GNN delta should be SCALED DOWN since VO is already good.
-
-IMPORTANT: This script assumes the GNN was properly trained to output small corrections.
-If the model was trained with incorrect inputs, the deltas will be large and wrong.
+This script loads a trained GNN model and predicts optimized relative poses
+for each window, then merges overlapping windows into a full trajectory.
 """
 
 import argparse
@@ -28,9 +25,7 @@ from utils.gnn_ba import (
     KITTI_STD_T,
     triangulate_all_points,
     build_heterogeneous_graph,
-    denormalize_poses,
     rotation_to_euler,
-    euler_to_rotation,
     post_processing,
     recover_trajectory_and_poses,
 )
@@ -95,14 +90,12 @@ def plot_trajectories(gt_poses, initial_poses, optimized_poses, save_path):
     print(f"Trajectory plot saved to: {save_path}")
 
 
-def predict_sequence_simple(
-    vo_model, gnn_model, dataset, args, device
-):
+def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
     """
     Inference using GNN-BA with proper post-processing of relative poses.
 
-    The GNN delta is applied to VO absolute poses to get optimized absolute poses.
-    Then relative poses are computed, normalized, and merged across overlapping windows
+    The GNN directly predicts optimized relative poses between consecutive frames.
+    These relative poses are normalized and merged across overlapping windows
     to produce a smooth continuous trajectory.
     """
     gnn_model.eval()
@@ -139,7 +132,7 @@ def predict_sequence_simple(
     # Step 2: Run GNN on each window, collect optimized relative poses
     print("\nStep 2: Running GNN optimization...")
     opt_relative_poses_list = []
-    delta_norms = []
+    rel_pose_norms = []
 
     for idx in tqdm(range(num_windows), desc="GNN optimization"):
         sample = dataset[idx]
@@ -197,36 +190,13 @@ def predict_sequence_simple(
                 data = data.to(device)
 
                 with torch.no_grad():
-                    camera_delta, _ = gnn_model(data, return_delta=True)
-                camera_delta_np = camera_delta.cpu().numpy()
-                delta_norms.append(np.linalg.norm(camera_delta_np))
+                    pred_rel_poses, _ = gnn_model(data, output_mode="relative")
+                rel_pose_norms.append(torch.norm(pred_rel_poses).item())
 
-                # Compute optimized absolute poses for this window
-                opt_abs_6dof = abs_poses_6dof + camera_delta_np
-
-                # Convert to 4x4 matrices
-                opt_abs_4x4 = []
-                for i in range(window_size):
-                    euler = opt_abs_6dof[i, :3]
-                    t = opt_abs_6dof[i, 3:]
-                    R = euler_to_rotation(euler, seq="zyx")
-                    mat = np.eye(4)
-                    mat[:3, :3] = R
-                    mat[:3, 3] = t
-                    opt_abs_4x4.append(mat)
-
-                # Compute relative poses between consecutive frames in the window
-                rel_poses_window = []
-                for i in range(window_size - 1):
-                    T_rel = np.linalg.inv(opt_abs_4x4[i]) @ opt_abs_4x4[i + 1]
-                    R_rel = T_rel[:3, :3]
-                    t_rel = T_rel[:3, 3]
-                    euler_rel = rotation_to_euler(R_rel, seq="zyx")
-                    # Normalize relative pose
-                    euler_norm = (euler_rel - KITTI_MEAN_ANGLES) / KITTI_STD_ANGLES
-                    t_norm = (t_rel - KITTI_MEAN_T) / KITTI_STD_T
-                    rel_poses_window.append(np.concatenate([euler_norm, t_norm]))
-                opt_relative_poses_list.append(np.array(rel_poses_window))
+                pred_rel_np = pred_rel_poses.detach().cpu().numpy()
+                euler_norm = (pred_rel_np[:, :3] - KITTI_MEAN_ANGLES) / KITTI_STD_ANGLES
+                t_norm = (pred_rel_np[:, 3:] - KITTI_MEAN_T) / KITTI_STD_T
+                opt_relative_poses_list.append(np.concatenate([euler_norm, t_norm], axis=1))
             else:
                 # Fallback: use VO relative poses for this window
                 opt_relative_poses_list.append(vo_relative_poses[idx])
@@ -245,9 +215,9 @@ def predict_sequence_simple(
         processed_opt_relative, norm=True
     )
     print(f"Optimized trajectory: {len(opt_poses)} poses")
-    if delta_norms:
+    if rel_pose_norms:
         print(
-            f"Delta norms - mean: {np.mean(delta_norms):.4f}, max: {np.max(delta_norms):.4f}"
+            f"Relative pose norms - mean: {np.mean(rel_pose_norms):.4f}, max: {np.max(rel_pose_norms):.4f}"
         )
 
     return vo_poses, opt_poses
@@ -325,7 +295,7 @@ def main():
 
     # Load GNN model
     print(f"\nLoading GNN model from: {args.gnn_model}")
-    gnn_model = GNNBAOptimizer(hidden_dim=32, num_layers=3).to(device)
+    gnn_model = GNNBAOptimizer(hidden_dim=128, num_layers=3).to(device)
     checkpoint = torch.load(args.gnn_model, map_location=device, weights_only=False)
     gnn_model.load_state_dict(checkpoint["model_state_dict"])
     gnn_model.eval()

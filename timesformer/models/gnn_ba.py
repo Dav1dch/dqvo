@@ -106,10 +106,11 @@ class GNNBAOptimizer(nn.Module):
     - Edge type: camera observes point (from triangulated tracks)
     - Embedding: camera [6], point [3] -> hidden_dim
     - num_layers message passing iterations
-    - Output: delta_camera [6], delta_point [3]
+    - Output: optimized relative camera poses [window_size-1, 6]
+    - Point output: refined point positions [N_pt, 3]
 
-    The GNN learns optimized pose corrections (deltas) to be added to input poses.
-    Input poses can be either absolute poses or relative poses.
+    The model can still optionally return legacy per-camera deltas for debugging
+    via return_delta=True, but training/inference should use direct relative output.
     """
 
     def __init__(self, hidden_dim=32, num_layers=3):
@@ -130,18 +131,27 @@ class GNNBAOptimizer(nn.Module):
             [MessagePassingLayer(hidden_dim) for _ in range(num_layers)]
         )
 
-        # Output projections: hidden -> delta (6 for camera, 3 for point)
-        # Camera delta is small correction to be added to input pose
+        # Legacy camera delta projection (kept for backward compatibility)
         self.camera_out_proj = nn.Linear(hidden_dim, 6)
+        # Direct relative pose head for consecutive camera pairs
+        self.relative_pose_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 6),
+        )
         self.point_out_proj = nn.Linear(hidden_dim, 3)
 
         # Initialize output layers with small weights to ensure small initial deltas
         nn.init.xavier_uniform_(self.camera_out_proj.weight, gain=0.01)
         nn.init.zeros_(self.camera_out_proj.bias)
+        nn.init.xavier_uniform_(self.relative_pose_head[-1].weight, gain=0.01)
+        nn.init.zeros_(self.relative_pose_head[-1].bias)
         nn.init.xavier_uniform_(self.point_out_proj.weight, gain=0.01)
         nn.init.zeros_(self.point_out_proj.bias)
 
-    def forward(self, data, return_delta=False):
+    def forward(self, data, return_delta=False, output_mode="absolute"):
         """
         Forward pass through GNN.
 
@@ -151,11 +161,22 @@ class GNNBAOptimizer(nn.Module):
                 - data['point'].x: (N_pt, 3) 3D point positions
                 - data['camera', 'observes', 'point'].edge_index: (2, N_obs)
                 - data['camera', 'observes', 'point'].edge_attr: (N_obs, 2) normalized u,v
-            return_delta: if True, return delta to be added to input; if False, return refined pose
+            return_delta: if True, return legacy camera/point deltas.
+            output_mode: one of ["absolute", "relative"].
+                - "absolute": return refined per-camera 6-DoF features (legacy behavior)
+                - "relative": return direct optimized relative poses for consecutive pairs
 
         Returns:
-            camera: (N_cam, 6) predicted camera parameters (refined pose or delta)
-            point: (N_pt, 3) predicted point positions (refined or delta)
+            if return_delta=True:
+                camera_delta: (N_cam, 6)
+                point_delta: (N_pt, 3)
+            else:
+                if output_mode="absolute":
+                    camera_refined: (N_cam, 6)
+                    point_refined: (N_pt, 3)
+                if output_mode="relative":
+                    camera_relative: (N_cam-1, 6)
+                    point_refined: (N_pt, 3)
         """
         # Embed inputs
         x_dict = {
@@ -177,14 +198,28 @@ class GNNBAOptimizer(nn.Module):
         for layer in self.mp_layers:
             x_dict = layer(x_dict, edge_index_dict, edge_attr_dict)
 
-        # Project to output dimension - this is the delta to be added to input
+        # Legacy delta outputs
         camera_delta = self.camera_out_proj(x_dict["camera"])
         point_delta = self.point_out_proj(x_dict["point"])
 
         if return_delta:
             return camera_delta, point_delta
-        else:
-            # Return refined pose = input + delta
+
+        point_refined = data["point"].x + point_delta
+
+        if output_mode == "absolute":
             camera_refined = data["camera"].x + camera_delta
-            point_refined = data["point"].x + point_delta
             return camera_refined, point_refined
+
+        if output_mode == "relative":
+            camera_hidden = x_dict["camera"]
+            if camera_hidden.shape[0] < 2:
+                camera_relative = torch.zeros(
+                    0, 6, device=camera_hidden.device, dtype=camera_hidden.dtype
+                )
+            else:
+                pair_feat = torch.cat([camera_hidden[:-1], camera_hidden[1:]], dim=-1)
+                camera_relative = self.relative_pose_head(pair_feat)
+            return camera_relative, point_refined
+
+        raise ValueError(f"Unsupported output_mode: {output_mode}")
