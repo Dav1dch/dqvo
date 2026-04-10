@@ -118,6 +118,8 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
     epoch_loss = 0
     num_batches = 0
     running_loss = 0
+    running_reproj_loss = 0
+    running_pose_loss = 0
     num_loss_samples = 0
 
     # Copy normalization stats as numpy arrays (for triangulation functions)
@@ -284,7 +286,11 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
                 if valid_errors.numel() == 0:
                     continue
 
-                loss = huber_loss(valid_errors, delta=5.0).mean() * 0.01 + pose_loss
+                reproj_loss = huber_loss(valid_errors, delta=5.0).mean()
+                loss = (
+                    reproj_loss * args.get("reproj_weight", 0.01)
+                    + pose_loss * args.get("pose_weight", 1.0)
+                )
 
                 if not torch.isfinite(loss):
                     continue
@@ -297,6 +303,8 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
                     batch_loss = batch_loss + loss
 
                 running_loss += loss.item()
+                running_reproj_loss += reproj_loss.item()
+                running_pose_loss += pose_loss.item()
                 num_loss_samples += 1
                 valid_samples_in_batch += 1
 
@@ -309,9 +317,17 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
                 epoch_loss += batch_loss.item()
                 num_batches += 1
 
-            tepoch.set_postfix(avg_loss=running_loss / max(num_loss_samples, 1))
+            tepoch.set_postfix(
+                avg_loss=running_loss / max(num_loss_samples, 1),
+                avg_reproj=running_reproj_loss / max(num_loss_samples, 1),
+                avg_pose=running_pose_loss / max(num_loss_samples, 1),
+            )
 
-    return epoch_loss / max(num_batches, 1)
+    return {
+        "total": epoch_loss / max(num_batches, 1),
+        "reproj": running_reproj_loss / max(num_loss_samples, 1),
+        "pose": running_pose_loss / max(num_loss_samples, 1),
+    }
 
 
 def validate(model, gnn_model, val_loader, args, device):
@@ -672,6 +688,8 @@ def main():
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for optimizer")
     parser.add_argument("--weighted_loss", type=float, default=10.0, help="Weight for pose supervision loss")
+    parser.add_argument("--reproj_weight", type=float, default=0.01, help="Weight for reprojection loss term")
+    parser.add_argument("--pose_weight", type=float, default=1.0, help="Weight for total pose supervision term")
     parser.add_argument("--loss_clip", type=float, default=500.0, help="Skip batch update when total loss exceeds this value")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training (default: on)")
@@ -807,19 +825,27 @@ def main():
         "batch_size": args.batch_size,
         "overlap": args.overlap,
         "weighted_loss": args.weighted_loss,
+        "reproj_weight": args.reproj_weight,
+        "pose_weight": args.pose_weight,
         "loss_clip": args.loss_clip,
     }
 
     for epoch in range(1, args.num_epochs + 1):
-        train_loss = train_epoch(
+        train_metrics = train_epoch(
             vo_model, gnn_model, train_loader, optimizer, epoch, train_args, device
         )
         scheduler.step()
 
+        print(
+            f"Epoch {epoch}: Train Total = {train_metrics['total']:.4f}, "
+            f"Train Reproj = {train_metrics['reproj']:.4f}, "
+            f"Train Pose = {train_metrics['pose']:.4f}"
+        )
+
         if epoch % 10 == 0:
             val_metrics = validate(vo_model, gnn_model, val_loader, train_args, device)
             print(
-                f"Epoch {epoch}: Train Loss = {train_loss:.4f}, "
+                f"Epoch {epoch}: Train Loss = {train_metrics['total']:.4f}, "
                 f'Val Initial Error = {val_metrics["initial_error"]:.2f}px, '
                 f'Val Optimized Error = {val_metrics["optimized_error"]:.2f}px'
             )

@@ -8,7 +8,12 @@ Evaluation protocol:
     - GNN pose reconstructed from direct relative-pose predictions
 3. Visualize side-by-side:
    - Left: Frame 2 with matched feature points (from ORB matching between frame 1 & 2)
-   - Right: Frame 3 with reprojected points (VO and GNN) compared to observed keypoints
+    - Right: Frame 3 with reprojected points (VO and GNN) compared to observed keypoints
+
+Evaluation modes:
+- gt_points: evaluate all methods on GT-triangulated points
+- gnn_points: evaluate GNN on GNN-refined points from VO triangulation graph
+- both: print both GNN metrics and visualize gnn_points mode
 
 Usage:
     python visualize_reprojection.py --vo_checkpoint checkpoints/Exp51/checkpoint_best.pth --gnn_checkpoint gnn_ba_output/gnn_ba_best.pth --sequence 03
@@ -249,6 +254,13 @@ def main():
     parser.add_argument(
         "--gt_path", type=str, default="data/poses", help="Path to KITTI poses"
     )
+    parser.add_argument(
+        "--eval_mode",
+        type=str,
+        default="both",
+        choices=["gt_points", "gnn_points", "both"],
+        help="Evaluation mode for GNN reprojection error",
+    )
 
     args = parser.parse_args()
 
@@ -383,7 +395,7 @@ def main():
                         continue
 
                     points_3d_gt.append(X_3d)
-                    observations_frame2.append((len(points_3d_gt) - 1, u2, v2))
+                    observations_frame2.append((len(points_3d_gt) - 1, 2, u2, v2))
                     matches_on_frame2.append((u2, v2))
                 except Exception:
                     continue
@@ -421,7 +433,7 @@ def main():
         data = data.to(device)
 
         with torch.no_grad():
-            pred_rel_poses, _ = gnn_model(data, output_mode="relative")
+            pred_rel_poses, point_refined = gnn_model(data, output_mode="relative")
 
         # Denormalize GNN output and compose optimized absolute poses.
         pred_rel_np = pred_rel_poses.detach().cpu().numpy()  # normalized
@@ -447,13 +459,15 @@ def main():
             [[K["fx"], 0, K["cx"]], [0, K["fy"], K["cy"]], [0, 0, 1]], dtype=np.float64
         )
 
-        def compute_errors(poses, points):
+        def compute_errors(poses, points, observations, target_frame=2):
             errs = []
-            for pt_idx, u_obs, v_obs in observations_frame2:
+            for pt_idx, frame_idx, u_obs, v_obs in observations:
+                if frame_idx != target_frame:
+                    continue
                 if pt_idx >= len(points):
                     continue
                 X_h = np.append(points[pt_idx], 1.0)
-                pose_w2c = np.linalg.inv(poses[2])
+                pose_w2c = np.linalg.inv(poses[target_frame])
                 X_cam2 = pose_w2c @ X_h
                 if X_cam2[2] < 0.1:
                     continue
@@ -473,9 +487,27 @@ def main():
                 )
             return errs
 
-        gt_errors = compute_errors(gt_abs_poses, points_3d_gt)
-        vo_errors = compute_errors(vo_poses, points_3d_gt)
-        opt_errors = compute_errors(opt_poses, points_3d_gt)
+        gt_errors = compute_errors(gt_abs_poses, points_3d_gt, observations_frame2)
+        vo_errors = compute_errors(vo_poses, points_3d_gt, observations_frame2)
+        opt_errors_gt_points = compute_errors(opt_poses, points_3d_gt, observations_frame2)
+
+        point_refined_np = point_refined.detach().cpu().numpy()
+        observations_vo_frame2 = [
+            (pt_idx, frame_idx, u_obs, v_obs)
+            for pt_idx, frame_idx, u_obs, v_obs in graph_obs_vo
+            if frame_idx == 2
+        ]
+        opt_errors_gnn_points = compute_errors(
+            opt_poses, point_refined_np, observations_vo_frame2
+        )
+
+        if args.eval_mode == "gt_points":
+            opt_errors = opt_errors_gt_points
+        elif args.eval_mode == "gnn_points":
+            opt_errors = opt_errors_gnn_points
+        else:
+            # In dual mode, visualize the same metric used during training/inference.
+            opt_errors = opt_errors_gnn_points
 
         # Print errors
         if gt_errors:
@@ -484,9 +516,14 @@ def main():
         if vo_errors:
             vo_avg = np.mean([e["error"] for e in vo_errors])
             print(f"  VO avg reprojection error: {vo_avg:.4f} px")
-        if opt_errors:
-            opt_avg = np.mean([e["error"] for e in opt_errors])
-            print(f"  GNN avg reprojection error: {opt_avg:.4f} px")
+        if opt_errors_gt_points:
+            opt_avg_gt = np.mean([e["error"] for e in opt_errors_gt_points])
+            print(f"  GNN avg reprojection error (gt_points): {opt_avg_gt:.4f} px")
+        if opt_errors_gnn_points:
+            opt_avg_gnn = np.mean([e["error"] for e in opt_errors_gnn_points])
+            print(f"  GNN avg reprojection error (gnn_points): {opt_avg_gnn:.4f} px")
+        if not opt_errors:
+            print("  GNN reprojection error: no valid observations for selected eval mode")
 
         # === Step 4: Visualize side-by-side ===
         save_path = os.path.join(args.save_dir, f"reprojection_sample_{sample_idx}.png")
