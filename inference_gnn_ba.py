@@ -133,6 +133,9 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
     print("\nStep 2: Running GNN optimization...")
     opt_relative_poses_list = []
     rel_pose_norms = []
+    num_success = 0
+    num_triangulation_failed = 0
+    num_track_count_low = 0
 
     for idx in tqdm(range(num_windows), desc="GNN optimization"):
         sample = dataset[idx]
@@ -166,7 +169,7 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
         else:
             window_abs_poses = vo_poses[window_start : window_start + window_size]
 
-        # Convert absolute poses to 6-DOF (denormalized)
+        # Convert absolute poses to 6-DOF (denorm), then normalize for GNN
         abs_poses_6dof = []
         for pose in window_abs_poses:
             if isinstance(pose, torch.Tensor):
@@ -175,7 +178,7 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
             t = pose[:3, 3]
             euler = rotation_to_euler(R, seq="zyx")
             abs_poses_6dof.append(np.concatenate([euler, t]))
-        abs_poses_6dof = np.array(abs_poses_6dof)  # (window_size, 6)
+        abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
 
         # Build graph and run GNN if enough tracks
         if len(tracks) >= 10:
@@ -185,6 +188,7 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
                 data = build_heterogeneous_graph(
                     window_size, points_3d, graph_obs, img_height, img_width
                 )
+                # Use denormalized absolute poses directly as GNN input
                 camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
                 data = data.to(device)
@@ -193,15 +197,17 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
                     pred_rel_poses, _ = gnn_model(data, output_mode="relative")
                 rel_pose_norms.append(torch.norm(pred_rel_poses).item())
 
+                # GNN output is already normalized; use directly for post-processing
                 pred_rel_np = pred_rel_poses.detach().cpu().numpy()
-                euler_norm = (pred_rel_np[:, :3] - KITTI_MEAN_ANGLES) / KITTI_STD_ANGLES
-                t_norm = (pred_rel_np[:, 3:] - KITTI_MEAN_T) / KITTI_STD_T
-                opt_relative_poses_list.append(np.concatenate([euler_norm, t_norm], axis=1))
+                opt_relative_poses_list.append(pred_rel_np)
+                num_success += 1
             else:
                 # Fallback: use VO relative poses for this window
+                num_triangulation_failed += 1
                 opt_relative_poses_list.append(vo_relative_poses[idx])
         else:
             # Fallback: use VO relative poses for this window
+            num_track_count_low += 1
             opt_relative_poses_list.append(vo_relative_poses[idx])
 
     # Step 3: Merge optimized relative poses and recover absolute trajectory
@@ -218,6 +224,18 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
     if rel_pose_norms:
         print(
             f"Relative pose norms - mean: {np.mean(rel_pose_norms):.4f}, max: {np.max(rel_pose_norms):.4f}"
+        )
+
+    # Print debug statistics
+    print(f"\nGNN Optimization Debug Stats:")
+    print(
+        f"  Success: {num_success}/{num_windows} ({100*num_success/num_windows:.1f}%)"
+    )
+    print(f"  Triangulation failed: {num_triangulation_failed}")
+    print(f"  Track count low: {num_track_count_low}")
+    if num_success > 0:
+        print(
+            f"  Avg relative pose norm: {np.mean(rel_pose_norms):.6f}"
         )
 
     return vo_poses, opt_poses
@@ -238,6 +256,7 @@ def main():
         help="Path to trained GNN model",
     )
     parser.add_argument("--sequence", type=str, default="03", help="Sequence number")
+    parser.add_argument("--debug", action="store_true", help="Debug mode: use first 100 windows only")
     parser.add_argument("--window_size", type=int, default=3, help="Window size")
     parser.add_argument(
         "--overlap", type=int, default=2, help="Overlap between windows"
@@ -311,6 +330,9 @@ def main():
         overlap=args.overlap,
         max_points=200,
     )
+    if args.debug:
+        print(f"Debug mode: limiting dataset to first 100 windows")
+        dataset = torch.utils.data.Subset(dataset, list(range(min(100, len(dataset)))))
     print(f"Dataset size: {len(dataset)} windows")
 
     # Run inference
@@ -337,7 +359,7 @@ def main():
     print(f"Optimized poses saved to: {seq_opt_path}")
 
     # Plot trajectory comparison
-    gt_poses = dataset.gt_poses
+    gt_poses = dataset.dataset.gt_poses if isinstance(dataset, torch.utils.data.Subset) else dataset.gt_poses
     gt_poses_4x4 = []
     for pose_3x4 in gt_poses[: len(opt_poses)]:
         pose_4x4 = np.eye(4)

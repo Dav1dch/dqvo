@@ -413,8 +413,9 @@ def main():
             t = pose[:3, 3]
             euler = rotation_to_euler(R, seq='zyx')
             abs_poses_6dof.append(np.concatenate([euler, t]))
-        abs_poses_6dof = np.array(abs_poses_6dof)
+        abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
 
+        # Use denormalized absolute poses directly as GNN input
         camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
         data["camera"].x = camera_feats_tensor
         data = data.to(device)
@@ -422,14 +423,19 @@ def main():
         with torch.no_grad():
             pred_rel_poses, _ = gnn_model(data, output_mode="relative")
 
-        # Compose optimized absolute poses from direct relative outputs.
-        pred_rel_np = pred_rel_poses.detach().cpu().numpy()  # (window_size-1, 6)
+        # Denormalize GNN output and compose optimized absolute poses.
+        pred_rel_np = pred_rel_poses.detach().cpu().numpy()  # normalized
+        # Denormalize
+        pred_rel_np_denorm = pred_rel_np.copy()
+        pred_rel_np_denorm[:, :3] = pred_rel_np_denorm[:, :3] * KITTI_STD_ANGLES + KITTI_MEAN_ANGLES
+        pred_rel_np_denorm[:, 3:] = pred_rel_np_denorm[:, 3:] * KITTI_STD_T + KITTI_MEAN_T
+
         first_pose = vo_poses[0]
         if isinstance(first_pose, torch.Tensor):
             first_pose = first_pose.cpu().numpy()
 
         opt_poses = [first_pose.copy()]
-        for rel_pose in pred_rel_np:
+        for rel_pose in pred_rel_np_denorm:
             R_rel = euler_to_rotation(rel_pose[:3], seq="zyx")
             T_rel = np.eye(4)
             T_rel[:3, :3] = R_rel
