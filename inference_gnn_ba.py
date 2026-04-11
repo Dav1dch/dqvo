@@ -42,6 +42,42 @@ preprocess = transforms.Compose(
 )
 
 
+def enrich_graph_for_new_gnn(data, relative_pose_features):
+    """Add explicit point->camera and camera->camera edges expected by new GNN."""
+    obs_edge_type = ("camera", "observes", "point")
+    if obs_edge_type in data.edge_types:
+        cam_point_edge_index = data[obs_edge_type].edge_index
+        cam_point_edge_attr = data[obs_edge_type].edge_attr
+        data["point", "observed_by", "camera"].edge_index = torch.stack(
+            [cam_point_edge_index[1], cam_point_edge_index[0]], dim=0
+        )
+        data["point", "observed_by", "camera"].edge_attr = cam_point_edge_attr.clone()
+
+    num_cameras = data["camera"].x.shape[0]
+    num_c2c_edges = max(num_cameras - 1, 0)
+
+    if num_c2c_edges == 0:
+        c2c_edge_index = torch.zeros(2, 0, dtype=torch.long)
+        c2c_edge_attr = torch.zeros(0, 6, dtype=torch.float32)
+    else:
+        src = torch.arange(0, num_c2c_edges, dtype=torch.long)
+        dst = src + 1
+        c2c_edge_index = torch.stack([src, dst], dim=0)
+
+        rel_pose_tensor = torch.as_tensor(relative_pose_features, dtype=torch.float32)
+        if rel_pose_tensor.ndim == 3:
+            rel_pose_tensor = rel_pose_tensor[0]
+
+        c2c_edge_attr = torch.zeros(num_c2c_edges, 6, dtype=torch.float32)
+        usable = min(num_c2c_edges, rel_pose_tensor.shape[0])
+        if usable > 0:
+            c2c_edge_attr[:usable] = rel_pose_tensor[:usable, :6]
+
+    data["camera", "temporal", "camera"].edge_index = c2c_edge_index
+    data["camera", "temporal", "camera"].edge_attr = c2c_edge_attr
+    return data
+
+
 def plot_trajectories(gt_poses, initial_poses, optimized_poses, save_path):
     import matplotlib.pyplot as plt
 
@@ -191,6 +227,7 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
                 # Use denormalized absolute poses directly as GNN input
                 camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
+                data = enrich_graph_for_new_gnn(data, vo_relative_poses[idx])
                 data = data.to(device)
 
                 with torch.no_grad():
@@ -316,7 +353,15 @@ def main():
     print(f"\nLoading GNN model from: {args.gnn_model}")
     gnn_model = GNNBAOptimizer(hidden_dim=128, num_layers=3).to(device)
     checkpoint = torch.load(args.gnn_model, map_location=device, weights_only=False)
-    gnn_model.load_state_dict(checkpoint["model_state_dict"])
+    load_result = gnn_model.load_state_dict(
+        checkpoint["model_state_dict"], strict=False
+    )
+    if load_result.missing_keys or load_result.unexpected_keys:
+        print("Warning: loaded GNN checkpoint with non-strict key matching")
+        if load_result.missing_keys:
+            print(f"  Missing keys: {len(load_result.missing_keys)}")
+        if load_result.unexpected_keys:
+            print(f"  Unexpected keys: {len(load_result.unexpected_keys)}")
     gnn_model.eval()
     print("GNN model loaded successfully")
 

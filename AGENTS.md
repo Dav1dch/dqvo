@@ -1,215 +1,87 @@
-# Agent Guidelines for TSformer-VO
+# TSformer-VO Agent Guidelines
 
-PyTorch Visual Odometry project using Transformer architectures (TimeSformer, Mamba) for monocular camera pose estimation.
+PyTorch monocular visual odometry using TimeSformer/Mamba transformers. Based on KITTI dataset.
 
-## Project Overview
+## Critical Setup
 
-- **Language**: Python 3.8+ | **Framework**: PyTorch 1.10.1
-- **Key Libraries**: einops, tensorboard, torchvision, numpy, tqdm, pandas, OpenCV
+- **Python version**: exactly 3.8.0 (not 3.8+)
+- **PyTorch**: 1.10.1 (pinned in requirements.txt)
+- **Data location**: Create softlink `data/` → KITTI `sequences_jpg/` and `poses/`. The dataloader expects `data/sequences_jpg/` and `data/poses/` to exist. Do not copy; use symlink.
+- **First-run artifact**: `fp.pickle` (feature points) auto-generated on first dataset load (~minutes). Subsequent runs reuse it.
 
-## Workflow Rules
-
-### Before Editing Code
-**IMPORTANT**: Before making any code changes, you MUST create a `plan.md` file that outlines:
-1. What needs to be changed and why
-2. The specific files and locations that will be modified
-3. Step-by-step implementation plan
-4. How to verify the change works correctly
-
-```markdown
-# Plan: [Brief Task Description]
-
-## Objective
-[What this task accomplishes]
-
-## Files to Modify
-- `file1.py` - [what change]
-- `file2.py` - [what change]
-
-## Implementation Steps
-1. [First step]
-2. [Second step]
-3. [Third step]
-
-## Verification
-[How to confirm the change works]
-```
-
-## Build/Lint/Test Commands
+## Commands
 
 ```bash
-# Environment Setup
 conda create -n tsformer-vo python==3.8.0 && conda activate tsformer-vo
 pip install -r requirements.txt
 
-# Type Checking
-basedpyright
-
-# Running Code
-python train.py              # Training (edit hyperparameters in train.py)
-python predict_poses.py       # Inference (edit paths in file)
-python test.py                # SuperPoint test script
-python gnn_ba_test.py         # GNN Bundle Adjustment test
-python train_tri.py           # Triangulation training
-python train_gnn_ba.py        # GNN BA training
-python plot_results.py        # Trajectory visualization
-
-# Single file execution
-python <file_path>.py
+python train.py              # edit args dict inside file; writes args.pkl + args.txt in checkpoint dir
+python predict_poses.py       # edit checkpoint_path, checkpoint_name, sequences at top of file
+python test.py                # SuperPoint test (hardcoded image path)
+python train_tri.py           # triangulation training
+python train_gnn_ba.py        # GNN bundle adjustment training
+python gnn_ba_test.py         # GNN BA test
+python plot_results.py        # trajectory visualization (edit paths in file)
 ```
 
-## Code Style Guidelines
+## Repository Structure
 
-### Import Organization
-```python
-# Standard library imports
-import json
-import os
-import pickle
-from functools import partial
+- `train.py`, `predict_poses.py`, `train_tri.py`, `train_gnn_ba.py` — entrypoints (config via inline Python dicts)
+- `build_model.py` — model factory for ViT, CrossViT, Mamba, DeepVO variants
+- `datasets/kitti.py` — KITTI loader; generates `fp.pickle`; hardcoded normalization stats
+- `timesformer/models/` — model implementations (vit.py, mamba.py, deepvo.py, etc.)
+- `superpoint.py` — SuperPoint feature extractor
 
-# Third-party imports (alphabetically)
-import numpy as np
-import torch
-import torch.nn as nn
-from einops import rearrange, reduce, repeat
-from torch.utils.tensorboard.writer import SummaryWriter
-from torchvision import transforms
-from tqdm import tqdm
+## Configuration Pattern
 
-# Local imports
-from build_model import build_model
-from datasets.kitti import KITTI
-from timesformer.models.losses import dual_quaternion_loss
+All scripts use inline Python dictionaries, not argparse. Edit the `args` or `model_params` dicts directly in each script. Training saves `args.pkl` and `args.txt` alongside checkpoints; inference loads them back.
+
+## Data Format
+
+Expected directory layout after softlink:
 ```
-
-### Formatting
-- **Indentation**: 4 spaces | **Line length**: 100-120 target, 150 soft max
-- **Spacing**: One blank line between top-level definitions
-- **No trailing whitespace**
-
-### Type Annotations
-- Use type hints for non-obvious parameters/returns
-- `Optional[T]` over `Union[T, None]`, `List[T]`, `Dict[K, V]`, `Tuple[T, ...]`
-
-```python
-def train_epoch(model, train_loader, criterion, optimizer, epoch, 
-                tensorboard_writer, args) -> float: ...
-
-def compute_loss(y_hat: torch.Tensor, y: torch.Tensor, 
-                 criterion, args: Dict) -> torch.Tensor: ...
+data/
+  sequences_jpg/
+    00/image_0/000000.jpg
+    00/image_1/...
+    ...
+  poses/
+    00.txt
+    01.txt
+    ...
 ```
+Each pose file: N x 12 matrix (3x4 rotation+translation per frame).
 
-### Naming Conventions
-- **Functions/methods**: `snake_case` | **Classes**: `PascalCase`
-- **Constants**: `UPPER_SNAKE_CASE` | **Private members**: `_leading_underscore`
-- **Torch modules**: `self.conv1`, `self.fc`
+## Training Behavior
 
-```python
-class KITTI(torch.utils.data.Dataset):
-    def __init__(self, data_path: str, window_size: int = 3):
-        self.data_path = data_path
-        self._frame_id = 0
+- Validation runs every epoch (`if not epoch % 1:` in train.py:108)
+- Best model saved as `checkpoint_best.pth` (lowest val loss)
+- Periodic checkpoint every 20 epochs: `checkpoint_e20.pth`, `checkpoint_e40.pth`, …
+- Last checkpoint always saved: `checkpoint_last.pth`
+- TensorBoard logs written to checkpoint directory
+- `num_workers=4` for DataLoader; `batch_size` from `args["bsize"]`
+- Uses `torch.no_grad()` only in validation/inference, not training
 
-MAX_KEYPOINTS = 100
-DEFAULT_BATCH_SIZE = 8
-```
+## Inference Notes
 
-### Error Handling
-- Use try/except for specific expected errors with meaningful messages
-- Use `torch.no_grad()` during inference
+- `predict_poses.py` hardcodes `window_size=3`, `overlap=2` after loading args — may override checkpoint args
+- Model loaded with `strict=False` to ignore missing/extra keys
+- Output saved as `.npy` per sequence in `<checkpoint_path>/<checkpoint_name>/`
+- Inference DataLoader uses `batch_size=4`, `num_workers=10`
 
-```python
-try:
-    checkpoint = torch.load(path, weights_only=True)
-except FileNotFoundError as e:
-    print(f"Checkpoint not found: {e}")
-    raise
-```
+## Common Pitfalls
 
-### GPU/CUDA Handling
-```python
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(device)
-```
+- **CUDA OOM**: Reduce `batch_size` in train.py or predict_poses.py
+- **Missing data**: Ensure `data/` symlink exists; dataloader will fail silently on missing files
+- **fp.pickle stale**: Delete if you change feature extraction; regenerated on next load
+- **Checkpoint mismatch**: `args.pkl` must match model architecture; don't mix checkpoints across experiments
+- **Type checking**: `basedpyright` mentioned in older docs but not in requirements; ignore or install separately
+- **No validation split**: If dataset too small, val_loader may be empty; check `len(val_loader)` > 0
 
-### Docstrings
-- Triple double quotes `"""` | Args/Returns/Raises for complex functions
+## Style Reality Check
 
-```python
-def rotationMatrixToQuaternion3(m):
-    """
-    Converts a 3x3 rotation matrix to a quaternion.
-    Args:
-        m: 3x3 rotation matrix (np.matrix)
-    Returns:
-        q: Quaternion as (4,) ndarray [qx, qy, qz, qw]
-    """
-```
+The codebase does not follow the Python conventions listed in older AGENTS.md (no docstrings, no type hints, minimal error handling). Follow existing file patterns when editing.
 
-### PyTorch Model Conventions
-- Inherit from `nn.Module`, implement `forward()`, call `super().__init__()` first
-- Use `nn.ModuleList`/`nn.ModuleDict` for layer collections
+## Git Ignore
 
-```python
-class SuperPoint(nn.Module):
-    default_config = {'descriptor_dim': 256, 'nms_radius': 4}
-    
-    def __init__(self, config):
-        super().__init__()
-        self.config = {**self.default_config, **config}
-    
-    def forward(self, data):
-        return {'keypoints': keypoints, 'scores': scores, 'descriptors': descriptors}
-```
-
-### Data Loading
-- Inherit `torch.utils.data.Dataset`, implement `__len__` and `__getitem__`
-- DataLoader with `num_workers=4-8`
-
-```python
-class KITTI(torch.utils.data.Dataset):
-    def __len__(self): return len(self.windowed_data["w_idx"].unique())
-    def __getitem__(self, idx): return imgs, pt1, pt2, y, n_valid
-```
-
-### Configuration
-- Python dictionaries (not argparse), store args as `.pkl` and `.txt`
-
-```python
-args = {"data_dir": "data", "bsize": 8, "window_size": 3, "optimizer": "Adam", "lr": 1e-5}
-```
-
-### File Paths
-- `os.path.join()` for cross-platform | `Path` from pathlib
-
-```python
-path = Path(__file__).parent / 'weights' / 'model.pth'
-torch.load(str(path))
-```
-
-## Directory Structure
-```
-dqvo/
-├── build_model.py          # Model construction
-├── train.py                # Training script
-├── test.py                 # SuperPoint test
-├── predict_poses.py        # Inference
-├── plot_results.py         # Trajectory visualization
-├── superpoint.py           # SuperPoint model
-├── losses/                  # Custom loss functions
-│   └── triangulation_loss.py
-├── datasets/               # Dataset loaders
-│   ├── kitti.py, kitti_dual.py, kitti_gnn.py, kitti_fp.py
-│   └── utils.py
-└── timesformer/            # TimeSformer model code
-    ├── models/             # Model definitions (vit, mamba, deepvo, etc.)
-    └── datasets/           # Data loading utilities
-```
-
-## Common Issues
-1. **CUDA OOM**: Use `torch.no_grad()` during inference, reduce batch size
-2. **DataLoader workers**: Start with `num_workers=4`
-3. **Checkpoint loading**: Use `weights_only=True`
-4. **Mixed precision**: Not used; use FP32 consistently
-5. **Memory leaks**: Clear CUDA cache with `torch.cuda.empty_cache()`
+`data/`, `checkpoints/`, `*.pth`, `*.png`, `*.pdf`, `*.pt`, `Exp53/` are all gitignored. Do not commit trained models or data.

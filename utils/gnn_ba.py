@@ -575,18 +575,19 @@ def huber_loss(errors, delta=1.0):
     return 0.5 * quadratic**2 + delta * linear
 
 
-def compute_reprojection_error(poses_c2w, points_3d, observations, K):
+def compute_reprojection_error(poses_c2w, points_3d, observations, K, img_height, img_width):
     """
-    Compute RMS reprojection error (in pixels).
+    Compute RMS reprojection error in normalized coordinates [0,1].
 
     Args:
         poses_c2w: list or array of 4x4 camera poses (camera to world)
         points_3d: (N, 3) array of 3D points
         observations: (M, 4) array of [point_idx, frame_idx, u_obs, v_obs]
         K: camera intrinsics dict
+        img_height, img_width: image dimensions for normalization
 
     Returns:
-        RMS error in pixels
+        RMS error in normalized coordinate space [0,1]
     """
     errors = []
     if isinstance(K['fx'], torch.Tensor):
@@ -614,10 +615,14 @@ def compute_reprojection_error(poses_c2w, points_3d, observations, K):
             cam_coords = pose_w2c.cpu().numpy() @ point_h.T
         if cam_coords[2] < 0.1:
             continue
-        # Project: K * cam_coords -> pixel
+        # Project: K * cam_coords -> pixel coordinates
         proj = K_matrix @ cam_coords[:3]
         proj = (proj[:2] / proj[2]).flatten()
-        error = np.sqrt((proj[0] - u_obs)**2 + (proj[1] - v_obs)**2)
+        # Normalize both observed and projected to [0,1]
+        u_obs_norm = u_obs / img_width
+        v_obs_norm = v_obs / img_height
+        proj_norm = proj / np.array([img_width, img_height])
+        error = np.sqrt((proj_norm[0] - u_obs_norm)**2 + (proj_norm[1] - v_obs_norm)**2)
         errors.append(error)
 
     return np.sqrt(np.mean(np.array(errors)**2)) if errors else 0.0

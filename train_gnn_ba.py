@@ -219,6 +219,12 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
                 if len(points_3d) < 10:
                     continue
 
+                # Move triangulated points to GPU for reprojection loss
+                if not torch.is_tensor(points_3d):
+                    points_3d = torch.tensor(points_3d, dtype=torch.float32, device=device)
+                else:
+                    points_3d = points_3d.to(device)
+
                 # ---- Step 3: Build heterogeneous graph ----
                 data = build_heterogeneous_graph(
                     window_size, points_3d, graph_obs, img_height, img_width
@@ -245,19 +251,22 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
                 edge_index = data["camera", "observes", "point"].edge_index
                 edge_attr = data["camera", "observes", "point"].edge_attr
 
+                # Convert stored normalized observations back to pixel coordinates.
                 u_obs = edge_attr[:, 0] * img_width
                 v_obs = edge_attr[:, 1] * img_height
 
-                projected = project_points_torch(point_params, pose_matrices, K, device)
+                # Use triangulated points (fixed), not GNN-refined points
+                projected = project_points_torch(points_3d, pose_matrices, K, device)
                 cam_indices = edge_index[0]
                 pt_indices = edge_index[1]
                 proj_x = projected[cam_indices, pt_indices, 0]
                 proj_y = projected[cam_indices, pt_indices, 1]
                 errors = torch.sqrt((proj_x - u_obs) ** 2 + (proj_y - v_obs) ** 2)
 
+                # Depth check for valid observations (using fixed triangulated points)
                 poses_w2c = torch.inverse(pose_matrices)
                 points_h = torch.cat(
-                    [point_params, torch.ones(point_params.shape[0], 1, device=device)],
+                    [points_3d, torch.ones(points_3d.shape[0], 1, device=device)],
                     dim=1,
                 )
                 points_cam = torch.matmul(poses_w2c[:, :3, :], points_h.T)
@@ -429,8 +438,17 @@ def validate(model, gnn_model, val_loader, args, device):
                 opt_abs_np = opt_abs_T.cpu().numpy()
                 opt_poses = [opt_abs_np[i] for i in range(window_size)]
 
-                initial_error = compute_reprojection_error(vo_poses, points_3d, graph_obs, K)
-                optimized_error = compute_reprojection_error(opt_poses, opt_points_np, graph_obs, K)
+                # Use same triangulated points for both errors
+                if torch.is_tensor(points_3d):
+                    points_3d_np = points_3d.cpu().numpy()
+                else:
+                    points_3d_np = points_3d
+                initial_error = compute_reprojection_error(
+                    vo_poses, points_3d_np, graph_obs, K, img_height, img_width
+                )
+                optimized_error = compute_reprojection_error(
+                    opt_poses, points_3d_np, graph_obs, K, img_height, img_width
+                )
 
                 total_error_initial += initial_error
                 total_error_optimized += optimized_error

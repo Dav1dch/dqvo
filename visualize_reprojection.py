@@ -12,8 +12,7 @@ Evaluation protocol:
 
 Evaluation modes:
 - gt_points: evaluate all methods on GT-triangulated points
-- gnn_points: evaluate GNN on GNN-refined points from VO triangulation graph
-- both: print both GNN metrics and visualize gnn_points mode
+- both: print GT/VO/GNN pose comparison using GT-triangulated points
 
 Usage:
     python visualize_reprojection.py --vo_checkpoint checkpoints/Exp51/checkpoint_best.pth --gnn_checkpoint gnn_ba_output/gnn_ba_best.pth --sequence 03
@@ -56,6 +55,42 @@ preprocess = transforms.Compose(
         ),
     ]
 )
+
+
+def enrich_graph_for_new_gnn(data, relative_pose_features):
+    """Add explicit point->camera and camera->camera edges expected by new GNN."""
+    obs_edge_type = ("camera", "observes", "point")
+    if obs_edge_type in data.edge_types:
+        cam_point_edge_index = data[obs_edge_type].edge_index
+        cam_point_edge_attr = data[obs_edge_type].edge_attr
+        data["point", "observed_by", "camera"].edge_index = torch.stack(
+            [cam_point_edge_index[1], cam_point_edge_index[0]], dim=0
+        )
+        data["point", "observed_by", "camera"].edge_attr = cam_point_edge_attr.clone()
+
+    num_cameras = data["camera"].x.shape[0]
+    num_c2c_edges = max(num_cameras - 1, 0)
+
+    if num_c2c_edges == 0:
+        c2c_edge_index = torch.zeros(2, 0, dtype=torch.long)
+        c2c_edge_attr = torch.zeros(0, 6, dtype=torch.float32)
+    else:
+        src = torch.arange(0, num_c2c_edges, dtype=torch.long)
+        dst = src + 1
+        c2c_edge_index = torch.stack([src, dst], dim=0)
+
+        rel_pose_tensor = torch.as_tensor(relative_pose_features, dtype=torch.float32)
+        if rel_pose_tensor.ndim == 3:
+            rel_pose_tensor = rel_pose_tensor[0]
+
+        c2c_edge_attr = torch.zeros(num_c2c_edges, 6, dtype=torch.float32)
+        usable = min(num_c2c_edges, rel_pose_tensor.shape[0])
+        if usable > 0:
+            c2c_edge_attr[:usable] = rel_pose_tensor[:usable, :6]
+
+    data["camera", "temporal", "camera"].edge_index = c2c_edge_index
+    data["camera", "temporal", "camera"].edge_attr = c2c_edge_attr
+    return data
 
 
 def visualize_side_by_side(
@@ -257,9 +292,9 @@ def main():
     parser.add_argument(
         "--eval_mode",
         type=str,
-        default="both",
-        choices=["gt_points", "gnn_points", "both"],
-        help="Evaluation mode for GNN reprojection error",
+        default="gt_points",
+        choices=["gt_points", "both"],
+        help="Evaluation mode for reprojection error",
     )
 
     args = parser.parse_args()
@@ -302,7 +337,15 @@ def main():
     print(f"\nLoading GNN model from: {args.gnn_checkpoint}")
     gnn_model = GNNBAOptimizer(hidden_dim=args.hidden_dim, num_layers=3).to(device)
     checkpoint = torch.load(args.gnn_checkpoint, map_location=device)
-    gnn_model.load_state_dict(checkpoint["model_state_dict"])
+    load_result = gnn_model.load_state_dict(
+        checkpoint["model_state_dict"], strict=False
+    )
+    if load_result.missing_keys or load_result.unexpected_keys:
+        print("Warning: loaded GNN checkpoint with non-strict key matching")
+        if load_result.missing_keys:
+            print(f"  Missing keys: {len(load_result.missing_keys)}")
+        if load_result.unexpected_keys:
+            print(f"  Unexpected keys: {len(load_result.unexpected_keys)}")
     gnn_model.eval()
     print(f"GNN model loaded (epoch {checkpoint.get('epoch', '?')})")
 
@@ -345,6 +388,7 @@ def main():
         # Get VO poses
         with torch.no_grad():
             vo_output = vo_model(imgs_batch)
+        vo_output_np = vo_output.reshape(-1, 2, 6).detach().cpu().numpy()[0]
 
         vo_poses = denormalize_poses(
             vo_output,
@@ -430,10 +474,11 @@ def main():
         # Use denormalized absolute poses directly as GNN input
         camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
         data["camera"].x = camera_feats_tensor
+        data = enrich_graph_for_new_gnn(data, vo_output_np)
         data = data.to(device)
 
         with torch.no_grad():
-            pred_rel_poses, point_refined = gnn_model(data, output_mode="relative")
+            pred_rel_poses, _ = gnn_model(data, output_mode="relative")
 
         # Denormalize GNN output and compose optimized absolute poses.
         pred_rel_np = pred_rel_poses.detach().cpu().numpy()  # normalized
@@ -491,23 +536,10 @@ def main():
         vo_errors = compute_errors(vo_poses, points_3d_gt, observations_frame2)
         opt_errors_gt_points = compute_errors(opt_poses, points_3d_gt, observations_frame2)
 
-        point_refined_np = point_refined.detach().cpu().numpy()
-        observations_vo_frame2 = [
-            (pt_idx, frame_idx, u_obs, v_obs)
-            for pt_idx, frame_idx, u_obs, v_obs in graph_obs_vo
-            if frame_idx == 2
-        ]
-        opt_errors_gnn_points = compute_errors(
-            opt_poses, point_refined_np, observations_vo_frame2
-        )
-
         if args.eval_mode == "gt_points":
             opt_errors = opt_errors_gt_points
-        elif args.eval_mode == "gnn_points":
-            opt_errors = opt_errors_gnn_points
         else:
-            # In dual mode, visualize the same metric used during training/inference.
-            opt_errors = opt_errors_gnn_points
+            opt_errors = opt_errors_gt_points
 
         # Print errors
         if gt_errors:
@@ -519,9 +551,6 @@ def main():
         if opt_errors_gt_points:
             opt_avg_gt = np.mean([e["error"] for e in opt_errors_gt_points])
             print(f"  GNN avg reprojection error (gt_points): {opt_avg_gt:.4f} px")
-        if opt_errors_gnn_points:
-            opt_avg_gnn = np.mean([e["error"] for e in opt_errors_gnn_points])
-            print(f"  GNN avg reprojection error (gnn_points): {opt_avg_gnn:.4f} px")
         if not opt_errors:
             print("  GNN reprojection error: no valid observations for selected eval mode")
 
