@@ -218,7 +218,7 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
 
         # Build graph and run GNN if enough tracks
         if len(tracks) >= 10:
-            points_3d, graph_obs = triangulate_all_points(tracks, window_abs_poses, K)
+            points_3d, graph_obs, _ = triangulate_all_points(tracks, window_abs_poses, K)
             if len(points_3d) >= 10:
                 img_height, img_width = sample["images"][0].shape[:2]
                 data = build_heterogeneous_graph(
@@ -310,6 +310,7 @@ def main():
     parser.add_argument(
         "--save_dir", type=str, default="gnn_ba_output", help="Output directory"
     )
+    parser.add_argument("--num_layers", type=int, default=6, help="Number of GNN layers")
 
     args = parser.parse_args()
 
@@ -351,7 +352,7 @@ def main():
 
     # Load GNN model
     print(f"\nLoading GNN model from: {args.gnn_model}")
-    gnn_model = GNNBAOptimizer(hidden_dim=128, num_layers=3).to(device)
+    gnn_model = GNNBAOptimizer(hidden_dim=128, num_layers=args.num_layers).to(device)
     checkpoint = torch.load(args.gnn_model, map_location=device, weights_only=False)
     load_result = gnn_model.load_state_dict(
         checkpoint["model_state_dict"], strict=False

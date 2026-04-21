@@ -8,7 +8,7 @@ __pycache__/
 *.pot
 
 # gnn fp
-*.png
+
 *.pdf
 *.pth
 Exp53/

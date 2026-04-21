@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "foldersMap": {
+    "__archived__:/home/david": [
+      {
+        "id": "27d793a4-edab-4870-8880-afa10e6f8b1f",
+        "name": "Downloads",
+        "sessionIds": [
+          "ses_27f6f4f20ffe4EFg10N0RP2cDo",
+          "ses_27f6f4f22ffe0q6ivkS7Wpf9k6"
+        ],
+        "createdAt": 1776611621855,
+        "parentId": null
+      },
+      {
+        "id": "3f92cd93-7b02-4254-a96e-a8830e470e2b",
+        "name": "lua",
+        "sessionIds": [
+          "ses_2d1b64471ffeatGNWmtHqHa3tR"
+        ],
+        "createdAt": 1776611621855,
+        "parentId": null
+      },
+      {
+        "id": "787dc98b-f710-41ab-865e-c1274b24ebd6",
+        "name": "hypr",
+        "sessionIds": [
+          "ses_30a830c5affenylOOxAtY26dgW",
+          "ses_30de70092ffeUcoLx1Afh37VLg"
+        ],
+        "createdAt": 1776611621856,
+        "parentId": null
+      },
+      {
+        "id": "58942179-7a4b-484f-a822-7da1412b12b8",
+        "name": "project root",
+        "sessionIds": [
+          "ses_33bf85574ffe6NTGPFy4fCPnU6"
+        ],
+        "createdAt": 1776611621856,
+        "parentId": null
+      }
+    ],
+    "__archived__:/home/david/Codes/vo/dqvo": [
+      {
+        "id": "98b495d8-50fe-4cc6-9ca5-28bebad84852",
+        "name": "dqvo",
+        "sessionIds": [
+          "ses_25ab02274ffedXv8CXwVKImWB7",
+          "ses_25b44bb03ffePW5b1Gaa9RrlFN",
+          "ses_26dc59331ffeU2Uz9k1K0Gxqwq",
+          "ses_27f48b4ceffedyz6I9JkmiALxC",
+          "ses_27f6cea46ffeIIQR22iinkyojJ",
+          "ses_28503fe90ffefEohSvYK5WRHiS",
+          "ses_288927cf0ffe8c5Q0ZMVNF8sKW",
+          "ses_2d1a3a5c7ffehvdoiL3OPrFP0B",
+          "ses_2d1a3a5a0ffezy6sxetxdcQ22K",
+          "ses_2d6a01990ffeq73VFZCBNGCXil",
+          "ses_2da2c99efffeeUkjPLdWgEs20c",
+          "ses_2db69b5e1ffeaHJ6yc71MqXYyL",
+          "ses_2e5dbecdbffe3jA3fe3G4zpf5U",
+          "ses_2f94d2918ffeQZ2mLEcv3QGunz",
+          "ses_2f94cde9effeWFdaR3shvizHmG",
+          "ses_2f95315ecffeqStf2SqogHyHSu",
+          "ses_2f952e48dffeZUFujPMZzH7guO",
+          "ses_2fab713daffedXNOIb02IYKLGz"
+        ],
+        "createdAt": 1776611736888,
+        "parentId": null
+      }
+    ]
+  },
+  "collapsedFolderIds": [],
+  "updatedAt": 1776611737924
+}

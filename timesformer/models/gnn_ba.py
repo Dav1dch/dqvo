@@ -4,12 +4,13 @@ GNN-based Bundle Adjustment model.
 Refactored architecture with:
 - Node types: camera, point
 - Edge types: point->camera observations, camera->camera temporal links
-- Update order: point/camera interaction updates camera nodes first,
-  then camera/camera interaction updates temporal edge features
+- Update order per layer: c2c edge → point->camera → c2c edge
+- Deeper layers with LayerNorm + residual connections
 
 The final optimized pose output is read from camera-to-camera edge features.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -19,6 +20,7 @@ class PointToCameraLayer(nn.Module):
     Update camera node embeddings using point nodes and point-to-camera edges.
 
     Message direction is strictly: point -> camera.
+    Uses LayerNorm + residual connection for deeper architectures.
     """
 
     def __init__(self, hidden_dim, edge_dim):
@@ -37,6 +39,7 @@ class PointToCameraLayer(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, camera_hidden, point_hidden, edge_index, edge_attr):
         if edge_index.numel() == 0:
@@ -51,7 +54,7 @@ class PointToCameraLayer(nn.Module):
         )
         agg.index_add_(0, edge_index[1], msg)
         cam_update = self.update_net(torch.cat([camera_hidden, agg], dim=-1))
-        return camera_hidden + cam_update
+        return self.norm(camera_hidden + cam_update)
 
 
 class CameraEdgeUpdateLayer(nn.Module):
@@ -59,6 +62,7 @@ class CameraEdgeUpdateLayer(nn.Module):
     Update camera-to-camera edge embeddings using updated camera nodes.
 
     Edge direction is single-directional and should follow frame index order.
+    Uses LayerNorm + residual connection for deeper architectures.
     """
 
     def __init__(self, hidden_dim):
@@ -70,6 +74,7 @@ class CameraEdgeUpdateLayer(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, camera_hidden, edge_index, edge_hidden):
         if edge_index.numel() == 0:
@@ -78,7 +83,7 @@ class CameraEdgeUpdateLayer(nn.Module):
         cam_src = camera_hidden[edge_index[0]]
         cam_dst = camera_hidden[edge_index[1]]
         edge_delta = self.edge_update(torch.cat([cam_src, cam_dst, edge_hidden], dim=-1))
-        return edge_hidden + edge_delta
+        return self.norm(edge_hidden + edge_delta)
 
 
 class GNNBAOptimizer(nn.Module):
@@ -94,8 +99,9 @@ class GNNBAOptimizer(nn.Module):
     - camera -> camera: temporal edge with relative pose feature
 
     Update order per layer:
-    1) update camera nodes from points + point-to-camera edges
-    2) update camera-to-camera edges from updated camera nodes
+    1) update c2c edge embeddings from current camera nodes
+    2) update camera nodes from points + point-to-camera edges
+    3) update c2c edge embeddings from updated camera nodes
 
     The optimized relative pose is read out from updated camera-to-camera edges.
     """
@@ -103,7 +109,7 @@ class GNNBAOptimizer(nn.Module):
     def __init__(
         self,
         hidden_dim=32,
-        num_layers=3,
+        num_layers=6,
         camera_feat_dim=6,
         point_feat_dim=3,
         p2c_edge_dim=2,
@@ -210,9 +216,15 @@ class GNNBAOptimizer(nn.Module):
         if edge_attr is None:
             cam_x = data["camera"].x
             if cam_x.shape[-1] >= self.c2c_edge_dim and edge_index.shape[1] > 0:
-                edge_attr = cam_x[edge_index[1], : self.c2c_edge_dim] - cam_x[
+                diff = cam_x[edge_index[1], : self.c2c_edge_dim] - cam_x[
                     edge_index[0], : self.c2c_edge_dim
                 ]
+                # Normalize so GNN output matches the normalized loss space
+                std_a = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+                std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
+                std_vec = np.concatenate([std_a, std_t])
+                std_tensor = torch.tensor(std_vec, dtype=diff.dtype, device=diff.device)
+                edge_attr = diff / std_tensor
             else:
                 edge_attr = torch.zeros(
                     edge_index.shape[1],
@@ -225,7 +237,8 @@ class GNNBAOptimizer(nn.Module):
 
     def forward(self, data, return_delta=False, output_mode="absolute"):
         """
-        Forward pass through two-stage GNN.
+        Forward pass through GNN with per-layer update order:
+        c2c edge → point->camera → c2c edge.
 
         Args:
             data: PyTorch Geometric HeteroData with:
@@ -236,7 +249,7 @@ class GNNBAOptimizer(nn.Module):
             return_delta: if True, return legacy camera/point deltas.
             output_mode: one of ["absolute", "relative"].
                 - "absolute": return refined camera node outputs for compatibility
-                - "relative": return optimized camera-to-camera edge poses (recommended)
+                - "relative": return optimized camera-to-camera edge poses directly (recommended)
 
         Returns:
             if return_delta=True:
@@ -247,7 +260,7 @@ class GNNBAOptimizer(nn.Module):
                     camera_refined: (N_cam, 6)
                     point_refined: (N_pt, 3)
                 if output_mode="relative":
-                    camera_relative: (N_edge_c2c, 6)
+                    camera_relative: (N_edge_c2c, 6)  # optimized relative poses
                     point_refined: (N_pt, 3)
         """
         cam_x = data["camera"].x
@@ -261,10 +274,13 @@ class GNNBAOptimizer(nn.Module):
         p2c_edge_hidden = self.p2c_edge_embed(p2c_edge_attr)
         c2c_edge_hidden = self.c2c_edge_embed(c2c_edge_attr)
 
-        # Stage-wise updates: point->camera first, then camera->camera edges.
+        # Per-layer updates: c2c edge → point->camera → c2c edge
         for pt_cam_layer, cam_edge_layer in zip(
             self.point_to_camera_layers, self.camera_edge_layers
         ):
+            c2c_edge_hidden = cam_edge_layer(
+                camera_hidden, c2c_edge_index, c2c_edge_hidden
+            )
             camera_hidden = pt_cam_layer(
                 camera_hidden, point_hidden, p2c_edge_index, p2c_edge_hidden
             )
@@ -290,7 +306,7 @@ class GNNBAOptimizer(nn.Module):
 
         if output_mode == "relative":
             c2c_delta = self.c2c_pose_out_proj(c2c_edge_hidden)
-            camera_relative = c2c_edge_attr + c2c_delta
+            camera_relative = c2c_delta  # GNN directly outputs optimized relative pose
             return camera_relative, point_refined
 
         raise ValueError(f"Unsupported output_mode: {output_mode}")

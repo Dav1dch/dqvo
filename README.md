@@ -1,115 +1,159 @@
-# TSformer-VO: an end-to-end Transformer-based model for monocular visual odometry
+# GNN-BA-VO: GNN-Optimized Monocular Visual Odometry
 
 [![arXiv](https://img.shields.io/badge/cs.CV-arXiv%3A2305.06121-B31B1B.svg)](https://arxiv.org/abs/2305.06121)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aofrancani/TSformer-VO/blob/main/LICENSE)
 
-Official repository of "[Transformer-based model for monocular visual odometry: a video understanding approach](https://arxiv.org/abs/2305.06121)"
+A two-stage monocular visual odometry pipeline: a frozen Vision Transformer (VO) provides initial pose estimates, and a Graph Neural Network Bundle Adjustment (GNN-BA) module refines them by minimizing reprojection error over heterogeneous camera-point graphs.
 
-## Abstract
-*Estimating the camera pose given images of a single camera is a traditional task in mobile robots and autonomous vehicles. This problem is called monocular visual odometry and it often relies on geometric approaches that require engineering effort for a specific scenario. Deep learning methods have shown to be generalizable after proper training and a considerable amount of available data. Transformer-based architectures have dominated the state-of-the-art in natural language processing and computer vision tasks, such as image and video understanding. In this work, we deal with the monocular visual odometry as a video understanding task to estimate the 6-DoF camera's pose. We contribute by presenting the TSformer-VO model based on spatio-temporal self-attention mechanisms to extract features from clips and estimate the motions in an end-to-end manner. Our approach achieved competitive state-of-the-art performance compared with geometry-based and deep learning-based methods on the KITTI visual odometry dataset, outperforming the DeepVO implementation highly accepted in the visual odometry community.*
+Based on [TSformer-VO](https://arxiv.org/abs/2305.06121).
 
-<img src="tsformer-vo.jpg" width=1000>
+## Architecture
+
+```
+Images ──► VO Model (frozen) ──► Initial Relative Poses ──► Accumulate Absolute Poses
+                                                                      │
+                                          ORB + Optical Flow ──► 2D Tracks
+                                                                      │
+                                                        Triangulation (DLT) ──► 3D Points
+                                                                      │
+                                              Heterogeneous Graph (camera ↔ point edges)
+                                                                      │
+                                                     GNN-BA Optimizer ──► Refined Relative Poses
+                                                                      │
+                                              Post-processing & Accumulation ──► Final Trajectory
+```
+
+**GNN-BA Module** (`timesformer/models/gnn_ba.py`):
+- **Node types**: Camera (6-DoF pose features), Point (3D coordinates)
+- **Edge types**: Point→Camera (observation, 2D pixel features), Camera→Camera (temporal, relative pose features)
+- **Per-layer update**: Point→Camera message passing updates camera nodes, then Camera→Camera edges are updated from refined camera embeddings
+- **Output**: Optimized relative poses read from camera-to-camera edge features (residual on input)
+
+**Loss**: `reproj_weight × Huber(reprojection_error) + pose_weight × SmoothL1(GNN_rel_poses, GT_rel_poses)`
 
 ## Contents
 1. [Dataset](#1-dataset)
-2. [Pre-trained models](#2-pre-trained-models)
-3. [Setup](#3-setup)
-4. [Usage](#4-usage)
-5. [Evaluation](#5-evaluation)
-
+2. [Setup](#2-setup)
+3. [Usage](#3-usage)
+4. [Evaluation](#4-evaluation)
 
 ## 1. Dataset
-Download the [KITTI odometry dataset (grayscale).](https://www.cvlibs.net/datasets/kitti/eval_odometry.php)
 
-In this work, we use the `.jpg` format. You can convert the dataset to `.jpg` format with [png_to_jpg.py.](https://github.com/aofrancani/DPT-VO/blob/main/util/png_to_jpg.py)
+Download the [KITTI odometry dataset (grayscale)](https://www.cvlibs.net/datasets/kitti/eval_odometry.php). Images must be in `.png` format (the default). The GNN pipeline also reads `calib.txt` from each sequence directory for camera intrinsics.
 
-Create a simbolic link (Windows) or a softlink (Linux) to the dataset in the `dataset` folder:
-
-- On Windows:
-```mklink /D <path_to_your_project>\TSformer-VO\data <path_to_your_downloaded_data>```
-- On Linux: 
-```ln -s <path_to_your_downloaded_data> <path_to_your_project>/TSformer-VO/data```
-
-The data structure should be as follows:
-```
-|---TSformer-VO
-    |---data
-        |---sequences_jpg
-            |---00
-                |---image_0
-                    |---000000.png
-                    |---000001.png
-                    |---...
-                |---image_1
-                    |...
-                |---image_2
-                    |---...
-                |---image_3
-                    |---...
-            |---01
-            |---...
-		|---poses
-			|---00.txt
-			|---01.txt
-			|---...
+Create a softlink:
+```bash
+ln -s <path_to_kitti_data> <project_root>/data
 ```
 
-## 2. Pre-trained models
-
-Here you find the checkpoints of our trained-models. The architectures vary according to the number of frames (Nf) in the input clip, which also influences the last MLP head.
-
-**Google Drive folder**: [link to checkpoints in GDrive](https://drive.google.com/drive/folders/124Z8aCPtPVH4bsUR78NYaK4m6SLna2Kf?usp=share_link)
-
-| Model | Nf | Checkpoint (.pth) | Args (Model Parameters)|
-| --- | --- | --- | --- |
-| TSformer-VO-1 | 2 | [checkpoint_model1](https://drive.google.com/file/d/1p9tgK9hTwgC6-xRDtLecNJ8VYH0l5_aa/view?usp=sharing) | [args.pkl](https://drive.google.com/file/d/1qmD6pAmjYRqKNMs_3VQliFdqKjsN0YW9/view?usp=sharing) |
-| TSformer-VO-2 | 3 | [checkpoint_model2](https://drive.google.com/file/d/1ZnPvEf-fGpRoFcywaH2JVmaHjLgRa8Ez/view?usp=share_link) | [args.pkl](https://drive.google.com/file/d/1Ua-mCTYPzUoiyS5jadfm7TGz6zGKBevy/view?usp=share_link) |
-| TSformer-VO-3 | 4 | [checkpoint_model3](https://drive.google.com/file/d/1lYvLEXN5zWQy1dW5p6hEXdEOVH58JcoD/view?usp=sharing) | [args.pkl](https://drive.google.com/file/d/1kp-0R7v2pVRTNpxFXPG7DgBHLr7M2ct-/view?usp=share_link) |
-
-## 3. Setup
-- Create a virtual environment using Anaconda and activate it:
+Expected structure:
 ```
-conda create -n tsformer-vo python==3.8.0
-conda activate tsformer-vo
+data/
+  sequences_jpg/
+    {seq}/
+      image_2/*.png      # GNN pipeline uses image_2 (color cam)
+      calib.txt          # Intrinsics (P0 line for fx, fy, cx, cy)
+    ...
+  poses/
+    {seq}.txt            # Ground truth 3x4 pose matrices
 ```
-- Install dependencies (with environment activated):
-```
+
+## 2. Setup
+
+```bash
+conda create -n gnn-ba-vo python==3.8.0
+conda activate gnn-ba-vo
 pip install -r requirements.txt
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric -f https://data.pyg.org/whl/torch-1.10.0+cu113.html
 ```
 
-## 4. Usage
+PyTorch Geometric is required for the `HeteroData` graph construction and message passing.
 
-**PS**: So far we are changing the settings and hyperparameters directly in the variables and dictionaries. As further work, we will use pre-set configurations with the `argparse` module to make a user-friendly interface.
+## 3. Usage
 
-### 4.1. Training
+### 3.1. Train GNN-BA
 
-In `train.py`:
-- Manually set configuration in `args` (python dict);
-- Manually set the model hyperparameters in `model_params` (python dict);
-- Save and run the code `train.py`.
+```bash
+python train_gnn_ba.py \
+  --checkpoint checkpoints/Exp51/checkpoint_best.pth \
+  --sequence 03 \
+  --num_epochs 100 \
+  --hidden_dim 128 \
+  --lr 1e-4 \
+  --window_size 3 \
+  --overlap 2 \
+  --batch_size 16
+```
 
-### 4.2. Inference
+Key arguments (use `--help` for full list):
 
-In `predict_poses.py`:
-- Manually set the variables to read the checkpoint and sequences.
+| Argument | Default | Description |
+|---|---|---|
+| `--checkpoint` | `checkpoints/Exp51/checkpoint_best.pth` | Path to pretrained VO model |
+| `--sequence` | `03` | KITTI sequence to train on |
+| `--hidden_dim` | `128` | GNN hidden dimension |
+| `--lr` | `1e-4` | Learning rate |
+| `--weighted_loss` | `10.0` | Weight for angle supervision |
+| `--reproj_weight` | `0.01` | Reprojection loss weight |
+| `--pose_weight` | `1.0` | Pose supervision loss weight |
+| `--loss_clip` | `500.0` | Skip batch when loss exceeds this |
+| `--debug` | `False` | Limit dataset to first 100 windows |
 
-| **Variables**   | **Info**                                                                                                             |
-|-----------------|----------------------------------------------------------------------------------------------------------------------|
-| checkpoint_path | String with the path to the trained model you want to use for inference.  Ex: checkpoint_path = "checkpoints/Model1" |
-| checkpoint_name | String with the name of the desired checkpoint (name of the .pth file).  Ex: checkpoint_name = "checkpoint_model2_exp19" |
-| sequences       | List with strings representing the KITTI sequences.  Ex: sequences = ["03", "04", "10"]                              |
+The VO model is **frozen** (eval mode, no gradients). Only GNN parameters are optimized. Validation runs every 10 epochs. Best model saved as `gnn_ba_output/gnn_ba_best.pth`.
 
-### 4.3. Visualize Trajectories
-In `plot_results.py`:
-- Manually set the variables to the checkpoint and desired sequences, similarly to [Inference](#42-inference)
+### 3.2. Inference
 
+```bash
+python inference_gnn_ba.py \
+  --checkpoint checkpoints/Exp51/checkpoint_best.pth \
+  --gnn_model gnn_ba_output/gnn_ba_best.pth \
+  --sequence 03
+```
 
-## 5. Evaluation
-The evaluation is done with the [KITTI odometry evaluation toolbox](https://github.com/Huangying-Zhan/kitti-odom-eval). Please go to the [evaluation repository](https://github.com/Huangying-Zhan/kitti-odom-eval) to see more details about the evaluation metrics and how to run the toolbox.
+Outputs:
+- `gnn_ba_output/poses_{seq}_vo.txt` — VO-only trajectory
+- `gnn_ba_output/poses_{seq}_opt.txt` — GNN-optimized trajectory
+- `gnn_ba_output/trajectory_comparison.png` — Plot comparing GT, VO, and GNN trajectories
 
+### 3.3. Single-Window Debug Test
+
+```bash
+python gnn_ba_test.py --sequence 00 --num_frames 5 --num_epochs 100
+```
+
+Tests GNN-BA on a single window with noisy GT poses (no VO model needed). Useful for debugging reprojection error reduction and training dynamics.
+
+### 3.4. Legacy VO Training/Inference
+
+The original TSformer-VO pipeline is still available:
+
+```bash
+python train.py              # Edit args dict inside file
+python predict_poses.py      # Edit checkpoint_path, checkpoint_name, sequences at top
+python plot_results.py       # Trajectory visualization
+```
+
+These use inline Python dicts for configuration (not argparse).
+
+## 4. Evaluation
+
+Use the [KITTI odometry evaluation toolbox](https://github.com/Huangying-Zhan/kitti-odom-eval) to compute translational (%) and rotational (deg/100m) errors from the output `.txt` pose files.
+
+## Repository Structure
+
+```
+train_gnn_ba.py           # Main GNN-BA training (argparse)
+inference_gnn_ba.py        # GNN-BA inference (argparse)
+gnn_ba_test.py             # Single-window debug test (argparse)
+timesformer/models/gnn_ba.py   # GNNBAOptimizer model
+datasets/kitti_gnn.py      # KITTIFeatureDataset (ORB + optical flow tracks)
+utils/gnn_ba.py            # Triangulation, graph building, pose utils, losses
+train.py                   # Legacy VO training (inline dict config)
+predict_poses.py           # Legacy VO inference
+build_model.py             # VO model factory
+```
 
 ## Citation
-Please cite our paper you find this research useful in your work:
 
 ```bibtex
 @article{Francani2023,
@@ -122,8 +166,5 @@ Please cite our paper you find this research useful in your work:
 
 ## References
 
-Code adapted from [TimeSformer](https://github.com/facebookresearch/TimeSformer). 
-
-Check out our previous work on monocular visual odometry: [DPT-VO](https://github.com/aofrancani/DPT-VO)
-
- 
+Code adapted from [TimeSformer](https://github.com/facebookresearch/TimeSformer).
+Previous work: [DPT-VO](https://github.com/aofrancani/DPT-VO)

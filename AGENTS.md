@@ -1,87 +1,98 @@
-# TSformer-VO Agent Guidelines
+# GNN-BA-VO Agent Guidelines
 
-PyTorch monocular visual odometry using TimeSformer/Mamba transformers. Based on KITTI dataset.
+GNN-optimized monocular visual odometry: a frozen Vision Transformer provides initial pose estimates, and a Graph Neural Network Bundle Adjustment (GNN-BA) module refines them by minimizing reprojection error. Based on KITTI dataset.
 
 ## Critical Setup
 
 - **Python version**: exactly 3.8.0 (not 3.8+)
 - **PyTorch**: 1.10.1 (pinned in requirements.txt)
-- **Data location**: Create softlink `data/` → KITTI `sequences_jpg/` and `poses/`. The dataloader expects `data/sequences_jpg/` and `data/poses/` to exist. Do not copy; use symlink.
-- **First-run artifact**: `fp.pickle` (feature points) auto-generated on first dataset load (~minutes). Subsequent runs reuse it.
+- **PyTorch Geometric**: required (`torch-scatter`, `torch-sparse`, `torch-cluster`, `torch-spline-conv`, `torch-geometric`)
+- **Data location**: Create softlink `data/` → KITTI `sequences_jpg/` and `poses/`. The dataloader expects `data/sequences_jpg/` and `data/poses/`. The GNN pipeline also reads `calib.txt` from each sequence directory.
+- **First-run artifacts**: `fp.pickle` (feature points) auto-generated in project root on first legacy dataset load (~minutes). Reused across `kitti.py`, `kitti_fp.py`, `kitti_dual.py`. The GNN pipeline (`kitti_gnn.py`) does **not** use it — extracts features on-the-fly.
+- **Pretrained VO model**: Required checkpoint (e.g., `checkpoints/Exp51/checkpoint_best.pth`) must exist before GNN training/inference.
 
 ## Commands
 
 ```bash
-conda create -n tsformer-vo python==3.8.0 && conda activate tsformer-vo
+conda create -n gnn-ba-vo python==3.8.0 && conda activate gnn-ba-vo
 pip install -r requirements.txt
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric -f https://data.pyg.org/whl/torch-1.10.0+cu113.html
 
-python train.py              # edit args dict inside file; writes args.pkl + args.txt in checkpoint dir
-python predict_poses.py       # edit checkpoint_path, checkpoint_name, sequences at top of file
-python test.py                # SuperPoint test (hardcoded image path)
-python train_tri.py           # triangulation training
-python train_gnn_ba.py        # GNN bundle adjustment training
-python gnn_ba_test.py         # GNN BA test
-python plot_results.py        # trajectory visualization (edit paths in file)
+python train_gnn_ba.py       # GNN-BA training (argparse)
+python inference_gnn_ba.py   # GNN-BA inference (argparse)
+python gnn_ba_test.py        # Single-window debug test (argparse)
+python train.py              # Legacy VO training (inline dict config)
+python predict_poses.py      # Legacy VO inference (inline dict config)
+python plot_results.py       # Trajectory visualization (edit paths)
 ```
 
 ## Repository Structure
 
-- `train.py`, `predict_poses.py`, `train_tri.py`, `train_gnn_ba.py` — entrypoints (config via inline Python dicts)
-- `build_model.py` — model factory for ViT, CrossViT, Mamba, DeepVO variants
-- `datasets/kitti.py` — KITTI loader; generates `fp.pickle`; hardcoded normalization stats
-- `timesformer/models/` — model implementations (vit.py, mamba.py, deepvo.py, etc.)
-- `superpoint.py` — SuperPoint feature extractor
+- `train_gnn_ba.py` — main GNN-BA training entrypoint (uses argparse)
+- `inference_gnn_ba.py` — GNN-BA inference on full sequences
+- `gnn_ba_test.py` — single-window debug test (no VO model needed)
+- `train.py`, `predict_poses.py` — legacy VO-only pipeline (inline dict configs)
+- `timesformer/models/gnn_ba.py` — `GNNBAOptimizer` (heterogeneous GNN)
+- `datasets/kitti_gnn.py` — `KITTIFeatureDataset` (ORB features + optical flow tracks)
+- `utils/gnn_ba.py` — triangulation, graph building, pose utilities, losses
+- `build_model.py` — VO model factory (loads frozen backbone)
 
 ## Configuration Pattern
 
-All scripts use inline Python dictionaries, not argparse. Edit the `args` or `model_params` dicts directly in each script. Training saves `args.pkl` and `args.txt` alongside checkpoints; inference loads them back.
+- **Most scripts**: inline Python `dict`s (not argparse). Edit `args` and `model_params` directly in `train.py` and `predict_poses.py`.
+- **Exception**: `train_gnn_ba.py`, `inference_gnn_ba.py`, and `gnn_ba_test.py` use `argparse`. Run `python train_gnn_ba.py --help` to see options.
+- **GNN defaults** (train_gnn_ba.py): `hidden_dim=128`, `num_layers=6`, `lr=1e-4`, `window_size=3`, `overlap=2`, `batch_size=16`, `reproj_weight=0.01`, `pose_weight=1.0`, `point_weight=0.1`, `weighted_loss=10.0`, `save_dir=gnn_ba_output`.
+- **VO model config** is hardcoded in `train_gnn_ba.py` (lines 867–880): `dim=384`, `depth=16`, `heads=6`, `image_size=(224, 672)`, `patch_size=16`.
+- **Typecheck**: `basedpyright` in standard mode (`pyproject.toml`). Run `basedpyright` to typecheck, though the codebase has no type hints — expect many findings.
 
 ## Data Format
 
-Expected directory layout after softlink:
+Expected directory layout:
 ```
 data/
   sequences_jpg/
-    00/image_0/000000.jpg
-    00/image_1/...
-    ...
+    {seq}/image_2/*.png      # GNN pipeline uses image_2 (color cam)
+    {seq}/calib.txt          # Intrinsics (P0 line for fx, fy, cx, cy)
   poses/
-    00.txt
-    01.txt
-    ...
+    {seq}.txt                # Ground truth 3x4 pose matrices
 ```
-Each pose file: N x 12 matrix (3x4 rotation+translation per frame).
 
-## Training Behavior
+## Training Behavior (train_gnn_ba.py)
 
-- Validation runs every epoch (`if not epoch % 1:` in train.py:108)
-- Best model saved as `checkpoint_best.pth` (lowest val loss)
-- Periodic checkpoint every 20 epochs: `checkpoint_e20.pth`, `checkpoint_e40.pth`, …
-- Last checkpoint always saved: `checkpoint_last.pth`
-- TensorBoard logs written to checkpoint directory
-- `num_workers=4` for DataLoader; `batch_size` from `args["bsize"]`
-- Uses `torch.no_grad()` only in validation/inference, not training
+- **VO model is frozen** (eval mode, no gradients). Only GNN parameters are optimized.
+- **Validation** runs every 10 epochs. Metrics: initial vs optimized reprojection error (pixels).
+- **Best model** saved as `gnn_ba_output/gnn_ba_best.pth` (lowest val error).
+- **DataLoader**: `num_workers=16`, custom `collate_fn` for variable-size tracks/observations.
+- **Loss**: `reproj_weight × Huber(reprojection_error) + pose_weight × SmoothL1(GNN_rel_poses, GT_rel_poses) + point_weight × Huber(refined_points - GT_triangulated_points)`. Batches with `loss > loss_clip` are skipped.
+- **Deterministic training** enabled by default (`torch.backends.cudnn.deterministic=True`).
 
 ## Inference Notes
 
-- `predict_poses.py` hardcodes `window_size=3`, `overlap=2` after loading args — may override checkpoint args
-- Model loaded with `strict=False` to ignore missing/extra keys
-- Output saved as `.npy` per sequence in `<checkpoint_path>/<checkpoint_name>/`
-- Inference DataLoader uses `batch_size=4`, `num_workers=10`
+- `inference_gnn_ba.py`: argparse script; outputs `poses_{seq}_vo.txt` and `poses_{seq}_opt.txt` in `gnn_ba_output/`.
+- `gnn_ba_test.py`: single-window test with noisy GT poses; useful for debugging reprojection error dynamics.
+- `train_gnn_ba.py` after training runs final evaluation and trajectory plot generation automatically.
+- Window merging uses `post_processing()` and `recover_trajectory_and_poses()` from `utils/gnn_ba.py`.
 
 ## Common Pitfalls
 
-- **CUDA OOM**: Reduce `batch_size` in train.py or predict_poses.py
-- **Missing data**: Ensure `data/` symlink exists; dataloader will fail silently on missing files
-- **fp.pickle stale**: Delete if you change feature extraction; regenerated on next load
-- **Checkpoint mismatch**: `args.pkl` must match model architecture; don't mix checkpoints across experiments
-- **Type checking**: `basedpyright` mentioned in older docs but not in requirements; ignore or install separately
-- **No validation split**: If dataset too small, val_loader may be empty; check `len(val_loader)` > 0
+- **CUDA OOM**: Reduce `batch_size` (default 16) in `train_gnn_ba.py`.
+- **Missing data**: Ensure `data/` symlink exists and includes `calib.txt` in each sequence; GNN pipeline will fail silently or crash on missing intrinsics.
+- **Stale `fp.pickle`**: Delete if you change feature extraction method; regenerated on next load (~minutes).
+- **Checkpoint mismatch**: VO checkpoint architecture must match `build_model.py` expectations. GNN loads with `strict=False` only where noted.
+- **Empty validation loader**: If dataset too small, `val_loader` may be empty; check `len(val_loader) > 0` before validation.
+- **PyTorch Geometric missing**: Install all PyG dependencies from the specified URL; otherwise `ImportError` on `torch_geometric`.
+- **GNN requires full KITTI raw**: Unlike legacy VO, GNN needs `calib.txt` per sequence (present in KITTI raw downloads).
+- **Normalization stats hardcoded**: `KITTI_MEAN_ANGLES`, `KITTI_STD_ANGLES`, `KITTI_MEAN_T`, `KITTI_STD_T` in `utils/gnn_ba.py`. Do not change without retraining.
 
-## Style Reality Check
+## Style & Workflow
 
-The codebase does not follow the Python conventions listed in older AGENTS.md (no docstrings, no type hints, minimal error handling). Follow existing file patterns when editing.
+- Minimal docstrings, no type hints, little error handling. Follow existing patterns when editing.
+- Image normalization: mean `[0.34721234, 0.36705238, 0.36066107]`, std `[0.30737526, 0.31515116, 0.32020183]` (KITTI-specific).
+- Pose representation: 6-DoF (Euler angles ZYX + translation), normalized using the above stats.
+- Graph construction: `build_heterogeneous_graph()` creates `torch_geometric.data.HeteroData` with camera nodes, point nodes, and observation edges.
+- GNN architecture: `num_layers=6` default, `LayerNorm + residual` in each layer. Per-layer update order: `c2c edge → point→camera → c2c edge`.
+- Training uses mixed numpy/torch data flow; be careful with device placement and dtype conversions.
 
 ## Git Ignore
 
-`data/`, `checkpoints/`, `*.pth`, `*.png`, `*.pdf`, `*.pt`, `Exp53/` are all gitignored. Do not commit trained models or data.
+`data/`, `checkpoints/`, `*.pth`, `*.pdf`, `*.pt`, `Exp53/`, `__pycache__/`, `.idea/` are gitignored. `gnn_ba_output/` is **not** gitignored — avoid committing trained models or outputs there.

@@ -296,6 +296,7 @@ def main():
         choices=["gt_points", "both"],
         help="Evaluation mode for reprojection error",
     )
+    parser.add_argument("--num_layers", type=int, default=6, help="Number of GNN layers")
 
     args = parser.parse_args()
 
@@ -335,7 +336,7 @@ def main():
 
     # Load GNN model
     print(f"\nLoading GNN model from: {args.gnn_checkpoint}")
-    gnn_model = GNNBAOptimizer(hidden_dim=args.hidden_dim, num_layers=3).to(device)
+    gnn_model = GNNBAOptimizer(hidden_dim=args.hidden_dim, num_layers=args.num_layers).to(device)
     checkpoint = torch.load(args.gnn_checkpoint, map_location=device)
     load_result = gnn_model.load_state_dict(
         checkpoint["model_state_dict"], strict=False
@@ -451,7 +452,7 @@ def main():
 
         # === Step 2: Get optimized poses from GNN direct relative predictions ===
         # Triangulate using VO for GNN input (as in training)
-        points_vo, graph_obs_vo = triangulate_all_points(tracks, vo_poses, K)
+        points_vo, graph_obs_vo, _ = triangulate_all_points(tracks, vo_poses, K)
         if len(points_vo) < 10:
             continue
 

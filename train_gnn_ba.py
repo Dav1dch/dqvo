@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
+from torch_geometric.data import Batch
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -44,6 +45,8 @@ from utils.gnn_ba import (
     KITTI_MEAN_T,
     KITTI_STD_T,
     triangulate_all_points,
+    triangulate_tracks_no_filter,
+    triangulate_from_graph_obs,
     build_heterogeneous_graph,
     poses_to_camera_features,
     denormalize_poses,
@@ -75,8 +78,10 @@ preprocess = transforms.Compose(
 def relative_poses_to_absolute_torch(relative_poses, first_abs_pose, device):
     """Compose relative 6-DoF poses into absolute 4x4 poses with a fixed anchor."""
     rel_R = euler_to_rotation_torch(relative_poses[:, :3], seq="zyx")
-    rel_T = torch.eye(4, dtype=torch.float32, device=device).unsqueeze(0).repeat(
-        relative_poses.shape[0], 1, 1
+    rel_T = (
+        torch.eye(4, dtype=torch.float32, device=device)
+        .unsqueeze(0)
+        .repeat(relative_poses.shape[0], 1, 1)
     )
     rel_T[:, :3, :3] = rel_R
     rel_T[:, :3, 3] = relative_poses[:, 3:]
@@ -86,6 +91,25 @@ def relative_poses_to_absolute_torch(relative_poses, first_abs_pose, device):
         abs_list.append(abs_list[-1] @ rel_T[i])
 
     return torch.stack(abs_list, dim=0)
+
+
+def compute_normalized_c2c_edges(camera_feats, window_size):
+    """Compute normalized camera-to-camera edge attributes from camera features."""
+    cam_src = torch.arange(0, window_size - 1)
+    cam_dst = cam_src + 1
+    c2c_index = torch.stack([cam_src, cam_dst], dim=0)
+
+    ang_diff = camera_feats[1:, :3] - camera_feats[:-1, :3]
+    t_diff = camera_feats[1:, 3:6] - camera_feats[:-1, 3:6]
+    c2c_attr = torch.cat(
+        [
+            ang_diff / torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32),
+            t_diff / torch.tensor(KITTI_STD_T, dtype=torch.float32),
+        ],
+        dim=-1,
+    )
+
+    return c2c_index, c2c_attr
 
 
 def set_seed(seed: int, deterministic: bool = True):
@@ -103,42 +127,29 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
     """
     Train GNN-BA for one epoch.
 
-    Training pipeline for each batch (window):
-    1. Get images -> run through VO model -> get initial relative poses
-    2. Convert relative poses to absolute poses (accumulation)
-    3. Triangulate 3D points from tracks using initial poses
-    4. Build heterogeneous graph (camera nodes + point nodes + edges)
-    5. GNN forward pass -> predict optimized pose
-    8. Backprop Huber loss on reprojection error -> update GNN
-
-    Note: VO model is frozen (eval mode, no gradient). Only GNN is trained.
+    Batches VO and GNN forward passes across all samples in a dataloader batch.
+    Per-sample logic (preprocessing, triangulation, graph building, loss) stays
+    sequential because each sample has a variable-size graph.
     """
-    model.eval()  # Freeze VO model
-    gnn_model.train()  # Train GNN
+    model.eval()
+    gnn_model.train()
     epoch_loss = 0
     num_batches = 0
     running_loss = 0
     running_reproj_loss = 0
     running_pose_loss = 0
+    running_point_loss = 0
     num_loss_samples = 0
 
-    # Copy normalization stats as numpy arrays (for triangulation functions)
     mean_angles_np = KITTI_MEAN_ANGLES.copy()
     std_angles_np = KITTI_STD_ANGLES.copy()
     mean_t_np = KITTI_MEAN_T.copy()
     std_t_np = KITTI_STD_T.copy()
 
-    # Torch tensors for GPU computation
     mean_angles = torch.tensor(KITTI_MEAN_ANGLES, dtype=torch.float32, device=device)
     std_angles = torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32, device=device)
     mean_t = torch.tensor(KITTI_MEAN_T, dtype=torch.float32, device=device)
     std_t = torch.tensor(KITTI_STD_T, dtype=torch.float32, device=device)
-
-    # KITTI original resolution -> model input resolution
-    orig_width, orig_height = 1241, 376
-    target_width, target_height = 672, 224
-    scale_x = target_width / orig_width
-    scale_y = target_height / orig_height
 
     with tqdm(train_loader, unit="batch", dynamic_ncols=True) as tepoch:
         for batch_data in tepoch:
@@ -149,161 +160,253 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
             batch_size_eff = len(batch_data["images"])
 
             optimizer.zero_grad()
-            batch_loss = None
-            valid_samples_in_batch = 0
+
+            # ---- Phase 1: preprocess images + batched VO forward ----
+            all_pil_stacks = []
+            all_tracks = []
+            all_global_poses = []
+            all_img_dims = []
 
             for sample_idx in range(batch_size_eff):
-                global_poses = batch_data["global_poses"][sample_idx]
-                tracks = batch_data["tracks"][sample_idx]
                 images = batch_data["images"][sample_idx]
+                tracks = batch_data["tracks"][sample_idx]
+                global_poses = batch_data["global_poses"][sample_idx]
 
-                # Preprocess images for VO model (resize, normalize)
+                if isinstance(global_poses, torch.Tensor):
+                    global_poses = global_poses.cpu().numpy()
+
                 pil_images = []
                 for img in images:
                     if isinstance(img, torch.Tensor):
                         img = img.squeeze(0).numpy()
                     if len(img.shape) == 2:
                         img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                    pil_img = Image.fromarray(img)
-                    pil_images.append(preprocess(pil_img))
+                    pil_images.append(preprocess(Image.fromarray(img)))
 
-                imgs_batch = (
-                    torch.stack(pil_images, dim=1).squeeze(0).unsqueeze(0).to(device)
-                )
+                all_pil_stacks.append(torch.stack(pil_images, dim=1).squeeze(0))
+                all_tracks.append(tracks)
+                all_global_poses.append(global_poses)
+                all_img_dims.append(images[0].shape[:2])
 
-                # Use original image dimensions from the first image (for graph normalization)
-                img_height, img_width = images[0].shape[:2]
+            # Batched VO forward: (B, C, T, H, W)
+            vo_imgs = torch.stack(all_pil_stacks, dim=0).to(device)
+            with torch.no_grad():
+                vo_output_all = model(vo_imgs)  # (B, window_size-1, 6)
+            vo_output_np = vo_output_all.cpu().numpy()
 
-                # ---- Step 1: Get initial relative poses from VO model ----
-                with torch.no_grad():
-                    vo_output = model(imgs_batch)  # Shape: (1, window_size-1, 6)
+            # ---- Phase 2: per-sample triangulation + graph building ----
+            valid_data = []
+            for sample_idx in range(batch_size_eff):
+                tracks = all_tracks[sample_idx]
+                gt_relative_poses = all_global_poses[sample_idx]
+                img_height, img_width = all_img_dims[sample_idx]
+                vo_out = vo_output_np[sample_idx]  # (window_size-1, 6)
 
-                vo_output_np = vo_output.cpu().numpy()[0]  # (window_size-1, 6) - normalized
-
-                # Denormalize VO output for triangulation (needs real-world units)
+                # Denormalize relative poses and accumulate to absolute 4x4
                 rel_poses_denorm = []
-                for i in range(vo_output_np.shape[0]):
-                    euler = vo_output_np[i, :3] * std_angles_np + mean_angles_np
-                    t = vo_output_np[i, 3:] * std_t_np + mean_t_np
+                for i in range(vo_out.shape[0]):
+                    euler = vo_out[i, :3] * std_angles_np + mean_angles_np
+                    t = vo_out[i, 3:] * std_t_np + mean_t_np
                     rel_poses_denorm.append(np.concatenate([euler, t]))
 
-                # Accumulate denorm relative poses to get denorm absolute poses (for triangulation)
                 abs_poses_4x4 = [np.eye(4)]
                 for rel_pose in rel_poses_denorm:
-                    R = euler_to_rotation(rel_pose[:3], seq='zyx')
+                    R = euler_to_rotation(rel_pose[:3], seq="zyx")
                     T_rel = np.eye(4)
                     T_rel[:3, :3] = R
                     T_rel[:3, 3] = rel_pose[3:]
-                    abs_pose = abs_poses_4x4[-1] @ T_rel
-                    abs_poses_4x4.append(abs_pose)
+                    abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
 
-                # Convert denorm absolute 4x4 poses to 6-DOF for GNN camera features
-                # GNN input uses denormalized absolute poses (first frame ~= 0 in world frame)
-                abs_poses_6dof_denorm = []
+                # Convert absolute 4x4 poses to 6-DOF for GNN camera features
+                abs_poses_6dof = []
                 for pose in abs_poses_4x4:
                     R = pose[:3, :3]
                     t = pose[:3, 3]
-                    euler = rotation_to_euler(R, seq='zyx')
-                    abs_poses_6dof_denorm.append(np.concatenate([euler, t]))
-                camera_feats_full = np.array(abs_poses_6dof_denorm)  # denorm, shape (window_size, 6)
-
-                gt_relative_poses = global_poses
-                if isinstance(gt_relative_poses, torch.Tensor):
-                    gt_relative_poses = gt_relative_poses.cpu().numpy()
+                    euler = rotation_to_euler(R, seq="zyx")
+                    abs_poses_6dof.append(np.concatenate([euler, t]))
+                camera_feats = np.array(abs_poses_6dof)
 
                 if len(tracks) < 10:
                     continue
 
-                # ---- Step 2: Triangulate 3D points ----
-                points_3d, graph_obs = triangulate_all_points(tracks, abs_poses_4x4, K)
+                points_3d, graph_obs, valid_tracks = triangulate_all_points(
+                    tracks, abs_poses_4x4, K
+                )
                 if len(points_3d) < 10:
                     continue
 
-                # Move triangulated points to GPU for reprojection loss
                 if not torch.is_tensor(points_3d):
-                    points_3d = torch.tensor(points_3d, dtype=torch.float32, device=device)
+                    points_3d = torch.tensor(
+                        points_3d, dtype=torch.float32, device=device
+                    )
                 else:
                     points_3d = points_3d.to(device)
 
-                # ---- Step 3: Build heterogeneous graph ----
                 data = build_heterogeneous_graph(
                     window_size, points_3d, graph_obs, img_height, img_width
                 )
-                data["camera"].x = torch.tensor(camera_feats_full, dtype=torch.float32)
+                data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
+
+                # Explicit camera-to-camera chain edges (prevents cross-sample
+                # edges when PyG batches the graphs). Normalize pose differences
+                # so the GNN output matches normalized GT.
+                cam_feats_t = data["camera"].x
+                c2c_index, c2c_attr = compute_normalized_c2c_edges(
+                    cam_feats_t, window_size
+                )
+                data["camera", "temporal", "camera"].edge_index = c2c_index
+                data["camera", "temporal", "camera"].edge_attr = c2c_attr
                 data = data.to(device)
 
-                # ---- Step 4: GNN forward (direct optimized relative poses) ----
-                pred_rel_poses, point_params = gnn_model(data, output_mode="relative")
+                # GT triangulation for point supervision (same tracks, no cheirality filter)
+                gt_abs_poses = batch_data["abs_poses"][sample_idx]
+                gt_points_3d = triangulate_tracks_no_filter(
+                    tracks, valid_tracks, gt_abs_poses, K, device
+                )
+                if not torch.is_tensor(gt_points_3d):
+                    gt_points_3d = torch.tensor(
+                        gt_points_3d, dtype=torch.float32, device=device
+                    )
+                else:
+                    gt_points_3d = gt_points_3d.to(device)
 
-                # ---- Step 5: Compose absolute poses from relative predictions ----
-                # GNN outputs normalized relative poses; denormalize before composition
-                pred_rel_poses_denorm = pred_rel_poses.clone()
-                pred_rel_poses_denorm[:, :3] = pred_rel_poses_denorm[:, :3] * std_angles + mean_angles
-                pred_rel_poses_denorm[:, 3:] = pred_rel_poses_denorm[:, 3:] * std_t + mean_t
-
-                # First absolute pose (denorm) from VO accumulation (abs_poses_4x4[0] is identity)
-                first_pose_tensor = torch.tensor(abs_poses_4x4[0], dtype=torch.float32, device=device)
-                pose_matrices = relative_poses_to_absolute_torch(
-                    pred_rel_poses_denorm, first_pose_tensor, device
+                valid_data.append(
+                    {
+                        "data": data,
+                        "points_3d": points_3d,
+                        "graph_obs": graph_obs,
+                        "camera_feats": camera_feats,
+                        "gt_rel": gt_relative_poses,
+                        "abs_poses_4x4": abs_poses_4x4,
+                        "gt_points_3d": gt_points_3d,
+                        "img_width": img_width,
+                        "img_height": img_height,
+                        "n_cam": window_size,
+                        "n_pts": points_3d.shape[0],
+                    }
                 )
 
-                # ---- Step 6: Reprojection loss ----
-                edge_index = data["camera", "observes", "point"].edge_index
-                edge_attr = data["camera", "observes", "point"].edge_attr
+            if not valid_data:
+                continue
 
-                # Convert stored normalized observations back to pixel coordinates.
+            # ---- Phase 3: batched GNN forward ----
+            graphs = [d["data"] for d in valid_data]
+            gnn_batch = Batch.from_data_list(graphs).to(device)
+            pred_rel_poses_all, point_refined_all = gnn_model(
+                gnn_batch, output_mode="relative"
+            )
+
+            # ---- Phase 4: per-sample loss ----
+            batch_loss = None
+            valid_samples_in_batch = 0
+            edge_offset = 0
+            reproj_weight = args.get("reproj_weight", 0.01)
+            pose_weight = args.get("pose_weight", 1.0)
+            k = args.get("weighted_loss", 1.0)
+            loss_clip = args.get("loss_clip", 500.0)
+            n_edges_per_sample = window_size - 1
+
+            for i, sd in enumerate(valid_data):
+                n_cam = sd["n_cam"]
+                n_pts = sd["n_pts"]
+                points_3d = sd["points_3d"]
+                graph_obs = sd["graph_obs"]
+                img_width = sd["img_width"]
+                img_height = sd["img_height"]
+                abs_poses_4x4 = sd["abs_poses_4x4"]
+
+                pred_rel_poses = pred_rel_poses_all[
+                    edge_offset : edge_offset + n_edges_per_sample
+                ]
+
+                # Denormalize predicted relative poses
+                pred_rel_denorm = pred_rel_poses.clone()
+                pred_rel_denorm[:, :3] = (
+                    pred_rel_denorm[:, :3] * std_angles + mean_angles
+                )
+                pred_rel_denorm[:, 3:] = pred_rel_denorm[:, 3:] * std_t + mean_t
+
+                first_pose = torch.tensor(
+                    abs_poses_4x4[0], dtype=torch.float32, device=device
+                )
+                pose_matrices = relative_poses_to_absolute_torch(
+                    pred_rel_denorm, first_pose, device
+                )
+
+                # Reprojection error using GNN-refined points
+                edge_index = graphs[i]["camera", "observes", "point"].edge_index
+                edge_attr = graphs[i]["camera", "observes", "point"].edge_attr
                 u_obs = edge_attr[:, 0] * img_width
                 v_obs = edge_attr[:, 1] * img_height
 
-                # Use triangulated points (fixed), not GNN-refined points
-                projected = project_points_torch(points_3d, pose_matrices, K, device)
+                # Slice point_refined for this sample
+                pt_offset = sum(sd["n_pts"] for sd in valid_data[:i])
+                points_3d_refined = point_refined_all[pt_offset : pt_offset + n_pts]
+
+                if points_3d_refined.numel() == 0:
+                    edge_offset += n_edges_per_sample
+                    continue
+
+                # Reprojection error using GNN-refined points
+                projected = project_points_torch(
+                    points_3d_refined, pose_matrices, K, device
+                )
                 cam_indices = edge_index[0]
                 pt_indices = edge_index[1]
                 proj_x = projected[cam_indices, pt_indices, 0]
                 proj_y = projected[cam_indices, pt_indices, 1]
                 errors = torch.sqrt((proj_x - u_obs) ** 2 + (proj_y - v_obs) ** 2)
 
-                # Depth check for valid observations (using fixed triangulated points)
                 poses_w2c = torch.inverse(pose_matrices)
                 points_h = torch.cat(
-                    [points_3d, torch.ones(points_3d.shape[0], 1, device=device)],
-                    dim=1,
+                    [points_3d_refined, torch.ones(n_pts, 1, device=device)], dim=1
                 )
                 points_cam = torch.matmul(poses_w2c[:, :3, :], points_h.T)
                 depths = points_cam[:, 2, :]
                 obs_depths = depths[cam_indices, pt_indices]
-                valid_mask = obs_depths > 0.1
-                valid_errors = errors[valid_mask]
+                valid_errors = errors[obs_depths > 0.1]
 
-                # ---- Step 7: Relative pose supervision loss ----
-                # GT relative poses are denormalized; normalize to match GNN output space
-                gt_rel = gt_relative_poses
+                # Pose supervision loss
+                gt_rel = sd["gt_rel"]
                 if isinstance(gt_rel, np.ndarray) and gt_rel.ndim == 3:
                     gt_rel = gt_rel[0]
-
-                gt_rel_tensor = torch.as_tensor(gt_rel, dtype=torch.float32, device=device)
-                # Normalize GT to same scale as GNN output
+                gt_rel_tensor = torch.as_tensor(
+                    gt_rel, dtype=torch.float32, device=device
+                )
                 gt_rel_norm = gt_rel_tensor.clone()
                 gt_rel_norm[:, :3] = (gt_rel_norm[:, :3] - mean_angles) / std_angles
                 gt_rel_norm[:, 3:] = (gt_rel_norm[:, 3:] - mean_t) / std_t
 
-                k = args.get("weighted_loss", 1.0)
-                loss_angles = k * F.smooth_l1_loss(pred_rel_poses[:, :3], gt_rel_norm[:, :3])
-                loss_translation = F.smooth_l1_loss(pred_rel_poses[:, 3:], gt_rel_norm[:, 3:])
+                loss_angles = k * F.mse_loss(pred_rel_poses[:, :3], gt_rel_norm[:, :3])
+                loss_translation = F.mse_loss(pred_rel_poses[:, 3:], gt_rel_norm[:, 3:])
                 pose_loss = loss_angles + loss_translation
 
+                # Point triangulation loss: refined points vs GT triangulated points
+                gt_pts = sd["gt_points_3d"]
+                if gt_pts.numel() > 0 and points_3d_refined.shape[0] == gt_pts.shape[0]:
+                    point_loss = huber_loss(
+                        points_3d_refined - gt_pts, delta=0.1
+                    ).mean()
+                else:
+                    point_loss = torch.tensor(0.0, device=device)
+
                 if valid_errors.numel() == 0:
+                    edge_offset += n_edges_per_sample
                     continue
 
                 reproj_loss = huber_loss(valid_errors, delta=5.0).mean()
+                point_weight = args.get("point_weight", 0.1)
                 loss = (
-                    reproj_loss * args.get("reproj_weight", 0.01)
-                    + pose_loss * args.get("pose_weight", 1.0)
+                    reproj_loss * reproj_weight
+                    + pose_loss * pose_weight
+                    + point_loss * point_weight
                 )
 
                 if not torch.isfinite(loss):
+                    edge_offset += n_edges_per_sample
                     continue
-                if loss.item() > args.get("loss_clip", 500.0):
+                if loss.item() > loss_clip:
+                    edge_offset += n_edges_per_sample
                     continue
 
                 if batch_loss is None:
@@ -314,8 +417,10 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
                 running_loss += loss.item()
                 running_reproj_loss += reproj_loss.item()
                 running_pose_loss += pose_loss.item()
+                running_point_loss += point_loss.item()
                 num_loss_samples += 1
                 valid_samples_in_batch += 1
+                edge_offset += n_edges_per_sample
 
             if valid_samples_in_batch > 0:
                 batch_loss = batch_loss / valid_samples_in_batch
@@ -330,12 +435,14 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device):
                 avg_loss=running_loss / max(num_loss_samples, 1),
                 avg_reproj=running_reproj_loss / max(num_loss_samples, 1),
                 avg_pose=running_pose_loss / max(num_loss_samples, 1),
+                avg_point=running_point_loss / max(num_loss_samples, 1),
             )
 
     return {
         "total": epoch_loss / max(num_batches, 1),
         "reproj": running_reproj_loss / max(num_loss_samples, 1),
         "pose": running_pose_loss / max(num_loss_samples, 1),
+        "point": running_point_loss / max(num_loss_samples, 1),
     }
 
 
@@ -402,7 +509,7 @@ def validate(model, gnn_model, val_loader, args, device):
                 if len(tracks) < 10:
                     continue
 
-                points_3d, graph_obs = triangulate_all_points(tracks, vo_poses, K)
+                points_3d, graph_obs, _ = triangulate_all_points(tracks, vo_poses, K)
                 if len(points_3d) < 10:
                     continue
 
@@ -416,7 +523,7 @@ def validate(model, gnn_model, val_loader, args, device):
                         pose = pose.cpu().numpy()
                     R = pose[:3, :3]
                     t = pose[:3, 3]
-                    euler = rotation_to_euler(R, seq='zyx')
+                    euler = rotation_to_euler(R, seq="zyx")
                     abs_poses_6dof.append(np.concatenate([euler, t]))
                 abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
 
@@ -429,11 +536,19 @@ def validate(model, gnn_model, val_loader, args, device):
 
                 # Denormalize GNN output and compose absolute poses
                 pred_rel_poses_denorm = pred_rel_poses.clone()
-                pred_rel_poses_denorm[:, :3] = pred_rel_poses_denorm[:, :3] * std_angles_t + mean_angles_t
-                pred_rel_poses_denorm[:, 3:] = pred_rel_poses_denorm[:, 3:] * std_t_t + mean_t_t
+                pred_rel_poses_denorm[:, :3] = (
+                    pred_rel_poses_denorm[:, :3] * std_angles_t + mean_angles_t
+                )
+                pred_rel_poses_denorm[:, 3:] = (
+                    pred_rel_poses_denorm[:, 3:] * std_t_t + mean_t_t
+                )
 
-                first_pose_tensor = torch.tensor(vo_poses[0], dtype=torch.float32, device=device)
-                opt_abs_T = relative_poses_to_absolute_torch(pred_rel_poses_denorm, first_pose_tensor, device)
+                first_pose_tensor = torch.tensor(
+                    vo_poses[0], dtype=torch.float32, device=device
+                )
+                opt_abs_T = relative_poses_to_absolute_torch(
+                    pred_rel_poses_denorm, first_pose_tensor, device
+                )
                 opt_points_np = point_refined.cpu().numpy()
                 opt_abs_np = opt_abs_T.cpu().numpy()
                 opt_poses = [opt_abs_np[i] for i in range(window_size)]
@@ -616,7 +731,9 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
 
         if len(tracks) >= 10:
             # Triangulate 3D points using original K
-            points_3d, graph_obs = triangulate_all_points(tracks, window_abs_poses, K)
+            points_3d, graph_obs, _ = triangulate_all_points(
+                tracks, window_abs_poses, K
+            )
 
             if len(points_3d) >= 10:
                 # Original image dimensions for graph normalization
@@ -633,13 +750,19 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
                         pose = pose.cpu().numpy()
                     R = pose[:3, :3]
                     t = pose[:3, 3]
-                    euler = rotation_to_euler(R, seq='zyx')
+                    euler = rotation_to_euler(R, seq="zyx")
                     abs_poses_6dof.append(np.concatenate([euler, t]))
                 abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
 
                 # Use denormalized absolute poses directly as GNN input
                 camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
+
+                # Explicit normalized c2c edges (matches training)
+                cam_x = data["camera"].x
+                c2c_index, c2c_attr = compute_normalized_c2c_edges(cam_x, window_size)
+                data["camera", "temporal", "camera"].edge_index = c2c_index
+                data["camera", "temporal", "camera"].edge_attr = c2c_attr
                 data = data.to(device)
 
                 with torch.no_grad():
@@ -703,16 +826,57 @@ def main():
     parser.add_argument("--sequence", type=str, default="03", help="Sequence number")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension")
+    parser.add_argument(
+        "--num_layers", type=int, default=6, help="Number of GNN layers"
+    )
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for optimizer")
-    parser.add_argument("--weighted_loss", type=float, default=10.0, help="Weight for pose supervision loss")
-    parser.add_argument("--reproj_weight", type=float, default=0.01, help="Weight for reprojection loss term")
-    parser.add_argument("--pose_weight", type=float, default=1.0, help="Weight for total pose supervision term")
-    parser.add_argument("--loss_clip", type=float, default=500.0, help="Skip batch update when total loss exceeds this value")
+    parser.add_argument(
+        "--weight_decay", type=float, default=1e-4, help="Weight decay for optimizer"
+    )
+    parser.add_argument(
+        "--weighted_loss",
+        type=float,
+        default=10.0,
+        help="Weight for pose supervision loss",
+    )
+    parser.add_argument(
+        "--reproj_weight",
+        type=float,
+        default=0.01,
+        help="Weight for reprojection loss term",
+    )
+    parser.add_argument(
+        "--pose_weight",
+        type=float,
+        default=1.0,
+        help="Weight for total pose supervision term",
+    )
+    parser.add_argument(
+        "--point_weight",
+        type=float,
+        default=0.1,
+        help="Weight for GT triangulation point loss",
+    )
+    parser.add_argument(
+        "--loss_clip",
+        type=float,
+        default=500.0,
+        help="Skip batch update when total loss exceeds this value",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic training (default: on)")
-    parser.add_argument("--non_deterministic", action="store_true", help="Disable deterministic training")
-    parser.add_argument("--debug", action="store_true", help="Debug mode: use small dataset subset")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic training (default: on)",
+    )
+    parser.add_argument(
+        "--non_deterministic",
+        action="store_true",
+        help="Disable deterministic training",
+    )
+    parser.add_argument(
+        "--debug", action="store_true", help="Debug mode: use small dataset subset"
+    )
     parser.add_argument("--window_size", type=int, default=3, help="Window size")
     parser.add_argument(
         "--overlap", type=int, default=2, help="Overlap between windows"
@@ -783,16 +947,22 @@ def main():
         window_size=args.window_size,
         overlap=args.overlap,
         max_points=200,
-     )
+    )
 
     if args.debug:
         print(f"Debug mode: limiting dataset to first 100 windows")
-        full_dataset = torch.utils.data.Subset(full_dataset, list(range(min(100, len(full_dataset)))))
+        full_dataset = torch.utils.data.Subset(
+            full_dataset, list(range(min(100, len(full_dataset))))
+        )
 
     print(f"Dataset size: {len(full_dataset)} windows")
 
     # For Subset, gt_poses come from underlying dataset
-    gt_poses = full_dataset.dataset.gt_poses if isinstance(full_dataset, torch.utils.data.Subset) else full_dataset.gt_poses
+    gt_poses = (
+        full_dataset.dataset.gt_poses
+        if isinstance(full_dataset, torch.utils.data.Subset)
+        else full_dataset.gt_poses
+    )
 
     num_val = max(1, int(len(full_dataset) * args.val_split))
     train_size = max(1, len(full_dataset) - num_val)
@@ -808,26 +978,38 @@ def main():
         """Custom collate function to handle variable-size observations and tracks."""
         collated = {}
         for key in batch[0].keys():
-            if key in ['observations', 'tracks', 'images', 'keypoints', 'abs_poses']:
+            if key in ["observations", "tracks", "images", "keypoints", "abs_poses"]:
                 collated[key] = [sample[key] for sample in batch]
-            elif key == 'window_indices':
+            elif key == "window_indices":
                 collated[key] = [sample[key] for sample in batch]
-            elif key == 'K':
+            elif key == "K":
                 collated[key] = batch[0][key]
             elif isinstance(batch[0][key], np.ndarray):
-                collated[key] = torch.stack([torch.tensor(sample[key]) for sample in batch], dim=0)
+                collated[key] = torch.stack(
+                    [torch.tensor(sample[key]) for sample in batch], dim=0
+                )
             else:
                 collated[key] = [sample[key] for sample in batch]
         return collated
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, collate_fn=collate_fn
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=16,
+        collate_fn=collate_fn,
     )
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=16, collate_fn=collate_fn
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=16,
+        collate_fn=collate_fn,
     )
 
-    gnn_model = GNNBAOptimizer(hidden_dim=args.hidden_dim, num_layers=3).to(device)
+    gnn_model = GNNBAOptimizer(
+        hidden_dim=args.hidden_dim, num_layers=args.num_layers
+    ).to(device)
     optimizer = torch.optim.AdamW(
         gnn_model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -919,7 +1101,7 @@ def main():
     # Use original K and actual image dimensions
     img_height, img_width = test_sample["images"][0].shape[:2]
 
-    points_3d, graph_obs = triangulate_all_points(tracks, vo_poses, K)
+    points_3d, graph_obs, _ = triangulate_all_points(tracks, vo_poses, K)
     data = build_heterogeneous_graph(
         args.window_size, points_3d, graph_obs, img_height, img_width
     )
@@ -931,13 +1113,19 @@ def main():
             pose = pose.cpu().numpy()
         R = pose[:3, :3]
         t = pose[:3, 3]
-        euler = rotation_to_euler(R, seq='zyx')
+        euler = rotation_to_euler(R, seq="zyx")
         abs_poses_6dof.append(np.concatenate([euler, t]))
     abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
 
     # Use denormalized absolute poses directly as GNN input
     camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
     data["camera"].x = camera_feats_tensor
+
+    # Explicit normalized c2c edges (matches training)
+    cam_x = data["camera"].x
+    c2c_index, c2c_attr = compute_normalized_c2c_edges(cam_x, args.window_size)
+    data["camera", "temporal", "camera"].edge_index = c2c_index
+    data["camera", "temporal", "camera"].edge_attr = c2c_attr
     data = data.to(device)
 
     gnn_model.eval()
@@ -946,11 +1134,17 @@ def main():
 
     # Denormalize GNN output and compose optimized absolute trajectory
     pred_rel_poses_denorm = pred_rel_poses.clone()
-    pred_rel_poses_denorm[:, :3] = pred_rel_poses_denorm[:, :3] * torch.tensor(KITTI_STD_ANGLES, device=device) + torch.tensor(KITTI_MEAN_ANGLES, device=device)
-    pred_rel_poses_denorm[:, 3:] = pred_rel_poses_denorm[:, 3:] * torch.tensor(KITTI_STD_T, device=device) + torch.tensor(KITTI_MEAN_T, device=device)
+    pred_rel_poses_denorm[:, :3] = pred_rel_poses_denorm[:, :3] * torch.tensor(
+        KITTI_STD_ANGLES, device=device
+    ) + torch.tensor(KITTI_MEAN_ANGLES, device=device)
+    pred_rel_poses_denorm[:, 3:] = pred_rel_poses_denorm[:, 3:] * torch.tensor(
+        KITTI_STD_T, device=device
+    ) + torch.tensor(KITTI_MEAN_T, device=device)
 
     first_pose_tensor = torch.tensor(vo_poses[0], dtype=torch.float32, device=device)
-    opt_abs_T = relative_poses_to_absolute_torch(pred_rel_poses_denorm, first_pose_tensor, device)
+    opt_abs_T = relative_poses_to_absolute_torch(
+        pred_rel_poses_denorm, first_pose_tensor, device
+    )
     opt_points_np = point_refined.cpu().numpy()
 
     opt_abs_np = opt_abs_T.cpu().numpy()

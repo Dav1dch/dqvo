@@ -368,6 +368,63 @@ def triangulate_dlt(points_2d, poses, K, device='cpu'):
     return X / X[3]
 
 
+def triangulate_tracks_no_filter(tracks, track_indices, poses_c2w, K, device='cpu'):
+    """
+    Triangulate 3D points for specific tracks WITHOUT cheirality filtering.
+
+    Guarantees one output point per input track index, so point counts always match.
+    Used for GT triangulation where we need the same number of points as VO triangulation.
+
+    Args:
+        tracks: full list of tracks
+        track_indices: indices of tracks to triangulate (from VO triangulation valid_tracks)
+        poses_c2w: List of 4x4 camera poses (camera to world)
+        K: camera intrinsics dict
+        device: torch device
+
+    Returns:
+        points_3d: (N, 3) tensor with exactly len(track_indices) points
+    """
+    if isinstance(K['fx'], torch.Tensor):
+        K_matrix = torch.tensor([[K['fx'].item(), 0, K['cx'].item()],
+                                  [0, K['fy'].item(), K['cy'].item()],
+                                  [0, 0, 1]], dtype=torch.float32, device=device)
+    else:
+        K_matrix = torch.tensor([[K['fx'], 0, K['cx']],
+                                  [0, K['fy'], K['cy']],
+                                  [0, 0, 1]], dtype=torch.float32, device=device)
+
+    poses_w2c = []
+    for pose in poses_c2w:
+        if isinstance(pose, np.ndarray):
+            poses_w2c.append(np.linalg.inv(pose))
+        else:
+            poses_w2c.append(torch.inverse(pose))
+
+    points_3d = []
+    for track_idx in track_indices:
+        track = tracks[track_idx]
+        if len(track[0]) == 4:
+            pts_2d = [(t[2].item() if hasattr(t[2], 'item') else t[2],
+                       t[3].item() if hasattr(t[3], 'item') else t[3]) for t in track]
+            frame_indices = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
+        else:
+            pts_2d = [(t[1].item() if hasattr(t[1], 'item') else t[1],
+                       t[2].item() if hasattr(t[2], 'item') else t[2]) for t in track]
+            frame_indices = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
+
+        track_poses = [poses_w2c[i] for i in frame_indices]
+
+        try:
+            X = triangulate_dlt(pts_2d, track_poses, K_matrix, device=device)
+            X_3d = X[:3] / X[3]
+            points_3d.append(X_3d)
+        except Exception:
+            points_3d.append(torch.zeros(3, dtype=torch.float32, device=device))
+
+    return torch.stack(points_3d)
+
+
 def triangulate_all_points(tracks, poses_c2w, K, min_depth=0.1, device='cpu'):
     """
     Triangulate all 3D points from tracks.
@@ -388,6 +445,7 @@ def triangulate_all_points(tracks, poses_c2w, K, min_depth=0.1, device='cpu'):
     Returns:
         points_3d: (N, 3) torch tensor of triangulated 3D points
         observations: list of [point_idx, frame_idx, u, v] for graph edges
+        valid_track_indices: list of original track indices that passed triangulation
     """
     if isinstance(K['fx'], torch.Tensor):
         K_matrix = torch.tensor([[K['fx'].item(), 0, K['cx'].item()], 
@@ -408,6 +466,7 @@ def triangulate_all_points(tracks, poses_c2w, K, min_depth=0.1, device='cpu'):
             poses_w2c.append(torch.inverse(pose))
     points_3d = []
     observations = []
+    valid_track_indices = []
 
     for track_idx, track in enumerate(tracks):
         if len(track) < 2:
@@ -454,11 +513,96 @@ def triangulate_all_points(tracks, poses_c2w, K, min_depth=0.1, device='cpu'):
                     u = t[1].item() if hasattr(t[1], 'item') else t[1]
                     v = t[2].item() if hasattr(t[2], 'item') else t[2]
                 observations.append((len(points_3d) - 1, frame_idx, u, v))
+            valid_track_indices.append(track_idx)
 
     if points_3d:
-        return torch.stack(points_3d), observations
+        return torch.stack(points_3d), observations, valid_track_indices
     else:
-        return torch.zeros(0, 3, device=device, dtype=torch.float32), observations
+        return torch.zeros(0, 3, device=device, dtype=torch.float32), observations, []
+
+
+def triangulate_from_graph_obs(edge_index, edge_attr, poses_c2w, K, device='cpu', min_depth=0.1):
+    """
+    Differentiable batched triangulation from GNN-predicted poses using graph observations.
+
+    Re-triangulates 3D points from camera poses and observation edges.
+    Used during training to compute reprojection loss with GNN-predicted poses.
+    Fully differentiable - no .item() calls that break the computation graph.
+
+    Args:
+        edge_index: (2, M) tensor [cam_indices, point_indices] from ('camera', 'observes', 'point')
+        edge_attr: (M, 2) tensor [u_norm, v_norm] normalized pixel coordinates
+        poses_c2w: (N_cam, 4, 4) tensor of camera-to-world poses
+        K: camera intrinsics dict with fx, fy, cx, cy
+        device: torch device
+        min_depth: minimum valid depth for cheirality check
+
+    Returns:
+        points_3d: (N_pts, 3) tensor of triangulated 3D points
+    """
+    if isinstance(K['fx'], torch.Tensor):
+        fx, fy, cx, cy = K['fx'].item(), K['fy'].item(), K['cx'].item(), K['cy'].item()
+    else:
+        fx, fy, cx, cy = K['fx'], K['fy'], K['cx'], K['cy']
+
+    img_width = edge_attr[:, 0].max().item() if edge_attr.numel() > 0 else 672
+    img_height = edge_attr[:, 1].max().item() if edge_attr.numel() > 0 else 224
+
+    u_all = edge_attr[:, 0] * img_width
+    v_all = edge_attr[:, 1] * img_height
+
+    cam_indices = edge_index[0]
+    pt_indices = edge_index[1]
+
+    N_pts = pt_indices.max().item() + 1 if pt_indices.numel() > 0 else 0
+
+    if N_pts == 0:
+        return torch.zeros(0, 3, device=device, dtype=torch.float32)
+
+    K_matrix = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=torch.float32, device=device)
+    K_inv = torch.inverse(K_matrix)
+
+    points_3d_list = []
+
+    for pt_idx in range(N_pts):
+        mask = pt_indices == pt_idx
+        n_obs = mask.sum().item()
+        if n_obs < 2:
+            continue
+
+        u_obs = u_all[mask]
+        v_obs = v_all[mask]
+        cam_idx = cam_indices[mask].long()
+
+        A_rows = []
+        for j in range(n_obs):
+            u, v = u_obs[j], v_obs[j]
+            ci = cam_idx[j]
+            P = poses_c2w[ci]
+
+            pt = torch.stack([u, v, torch.tensor(1.0, device=device)])
+            pt_norm = K_inv @ pt
+
+            A_rows.append(pt_norm[0] * P[2, :] - P[0, :])
+            A_rows.append(pt_norm[1] * P[2, :] - P[1, :])
+
+        if len(A_rows) < 4:
+            continue
+
+        A = torch.stack(A_rows)
+        _, _, Vt = torch.linalg.svd(A)
+        X = Vt[-1]
+
+        if X[3].abs() < 1e-10:
+            continue
+
+        X_3d = X[:3] / X[3]
+        points_3d_list.append(X_3d)
+
+    if len(points_3d_list) == 0:
+        return torch.zeros(0, 3, device=device, dtype=torch.float32)
+
+    return torch.stack(points_3d_list)
 
 
 # =============================================================================
@@ -618,11 +762,7 @@ def compute_reprojection_error(poses_c2w, points_3d, observations, K, img_height
         # Project: K * cam_coords -> pixel coordinates
         proj = K_matrix @ cam_coords[:3]
         proj = (proj[:2] / proj[2]).flatten()
-        # Normalize both observed and projected to [0,1]
-        u_obs_norm = u_obs / img_width
-        v_obs_norm = v_obs / img_height
-        proj_norm = proj / np.array([img_width, img_height])
-        error = np.sqrt((proj_norm[0] - u_obs_norm)**2 + (proj_norm[1] - v_obs_norm)**2)
+        error = np.sqrt((proj[0] - u_obs)**2 + (proj[1] - v_obs)**2)
         errors.append(error)
 
     return np.sqrt(np.mean(np.array(errors)**2)) if errors else 0.0

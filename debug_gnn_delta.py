@@ -62,7 +62,7 @@ def main():
     vo_model.eval()
     
     # Load GNN
-    gnn_model = GNNBAOptimizer(hidden_dim=32, num_layers=3).to(device)
+    gnn_model = GNNBAOptimizer(hidden_dim=32, num_layers=6).to(device)
     checkpoint = torch.load(args.gnn_model, map_location=device)
     gnn_model.load_state_dict(checkpoint["model_state_dict"])
     gnn_model.eval()
@@ -115,7 +115,7 @@ def main():
         if len(tracks) < 10:
             continue
             
-        points_3d, graph_obs = triangulate_all_points(tracks, vo_poses, K)
+        points_3d, graph_obs, _ = triangulate_all_points(tracks, vo_poses, K)
         if len(points_3d) < 10:
             continue
         
