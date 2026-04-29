@@ -4,7 +4,7 @@ GNN-based Bundle Adjustment model.
 Refactored architecture with:
 - Node types: camera, point
 - Edge types: point->camera observations, camera->camera temporal links
-- Update order per layer: c2c edge → point->camera → c2c edge
+- Update order per layer: c2c edge → point->camera → camera->point → c2c edge
 - Deeper layers with LayerNorm + residual connections
 
 The final optimized pose output is read from camera-to-camera edge features.
@@ -57,6 +57,49 @@ class PointToCameraLayer(nn.Module):
         return self.norm(camera_hidden + cam_update)
 
 
+class CameraToPointLayer(nn.Module):
+    """
+    Update point node embeddings using camera nodes and camera-to-point edges.
+
+    Message direction is strictly: camera -> point.
+    Enables iterative point refinement informed by camera pose updates.
+    Uses LayerNorm + residual connection for deeper architectures.
+    """
+
+    def __init__(self, hidden_dim, edge_dim):
+        super().__init__()
+        self.msg_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.update_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, point_hidden, camera_hidden, edge_index, edge_attr):
+        if edge_index.numel() == 0:
+            return point_hidden
+
+        src_camera = camera_hidden[edge_index[0]]
+        dst_point = point_hidden[edge_index[1]]
+        msg = self.msg_net(torch.cat([src_camera, dst_point, edge_attr], dim=-1))
+
+        agg = torch.zeros(
+            point_hidden.shape[0], msg.shape[-1], device=msg.device, dtype=msg.dtype
+        )
+        agg.index_add_(0, edge_index[1], msg)
+        pt_update = self.update_net(torch.cat([point_hidden, agg], dim=-1))
+        return self.norm(point_hidden + pt_update)
+
+
 class CameraEdgeUpdateLayer(nn.Module):
     """
     Update camera-to-camera edge embeddings using updated camera nodes.
@@ -101,7 +144,8 @@ class GNNBAOptimizer(nn.Module):
     Update order per layer:
     1) update c2c edge embeddings from current camera nodes
     2) update camera nodes from points + point-to-camera edges
-    3) update c2c edge embeddings from updated camera nodes
+    3) update point nodes from cameras + camera-to-point edges
+    4) update c2c edge embeddings from updated camera nodes
 
     The optimized relative pose is read out from updated camera-to-camera edges.
     """
@@ -131,6 +175,9 @@ class GNNBAOptimizer(nn.Module):
         self.point_to_camera_layers = nn.ModuleList(
             [PointToCameraLayer(hidden_dim, hidden_dim) for _ in range(num_layers)]
         )
+        self.camera_to_point_layers = nn.ModuleList(
+            [CameraToPointLayer(hidden_dim, hidden_dim) for _ in range(num_layers)]
+        )
         self.camera_edge_layers = nn.ModuleList(
             [CameraEdgeUpdateLayer(hidden_dim) for _ in range(num_layers)]
         )
@@ -143,7 +190,7 @@ class GNNBAOptimizer(nn.Module):
         # Small init keeps initial residual corrections stable.
         nn.init.xavier_uniform_(self.camera_out_proj.weight, gain=0.01)
         nn.init.zeros_(self.camera_out_proj.bias)
-        nn.init.xavier_uniform_(self.point_out_proj.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.point_out_proj.weight, gain=0.1)
         nn.init.zeros_(self.point_out_proj.bias)
         nn.init.xavier_uniform_(self.c2c_pose_out_proj.weight, gain=0.01)
         nn.init.zeros_(self.c2c_pose_out_proj.bias)
@@ -173,6 +220,33 @@ class GNNBAOptimizer(nn.Module):
         raise ValueError(
             "No point-to-camera edges found. Expect ('point', *, 'camera') "
             "or legacy ('camera', 'observes', 'point')."
+        )
+
+    def _resolve_c2p_edges(self, data):
+        """
+        Resolve camera->point edges for point refinement.
+
+        Searches for ('camera', *, 'point') edges (original direction).
+        Falls back to reversing ('point', *, 'camera') edges.
+        """
+        for edge_type in data.edge_types:
+            if edge_type[0] == "camera" and edge_type[2] == "point":
+                edge_store = data[edge_type]
+                edge_index = edge_store.edge_index
+                edge_attr = edge_store.edge_attr
+                return edge_index, edge_attr
+
+        for edge_type in data.edge_types:
+            if edge_type[0] == "point" and edge_type[2] == "camera":
+                edge_store = data[edge_type]
+                edge_index = edge_store.edge_index
+                edge_attr = edge_store.edge_attr
+                reversed_index = torch.stack([edge_index[1], edge_index[0]], dim=0)
+                return reversed_index, edge_attr
+
+        raise ValueError(
+            "No camera-to-point edges found. Expect ('camera', *, 'point') "
+            "or ('point', *, 'camera')."
         )
 
     def _resolve_c2c_edges(self, data):
@@ -238,7 +312,7 @@ class GNNBAOptimizer(nn.Module):
     def forward(self, data, return_delta=False, output_mode="absolute"):
         """
         Forward pass through GNN with per-layer update order:
-        c2c edge → point->camera → c2c edge.
+        c2c edge → point->camera → camera->point → c2c edge.
 
         Args:
             data: PyTorch Geometric HeteroData with:
@@ -267,22 +341,29 @@ class GNNBAOptimizer(nn.Module):
         pt_x = data["point"].x
 
         p2c_edge_index, p2c_edge_attr = self._resolve_p2c_edges(data)
+        c2p_edge_index, c2p_edge_attr = self._resolve_c2p_edges(data)
         c2c_edge_index, c2c_edge_attr = self._resolve_c2c_edges(data)
 
         camera_hidden = self.camera_embed(cam_x)
         point_hidden = self.point_embed(pt_x)
         p2c_edge_hidden = self.p2c_edge_embed(p2c_edge_attr)
+        c2p_edge_hidden = self.p2c_edge_embed(c2p_edge_attr)
         c2c_edge_hidden = self.c2c_edge_embed(c2c_edge_attr)
 
-        # Per-layer updates: c2c edge → point->camera → c2c edge
-        for pt_cam_layer, cam_edge_layer in zip(
-            self.point_to_camera_layers, self.camera_edge_layers
+        # Per-layer updates: c2c edge → point->camera → camera->point → c2c edge
+        for pt_cam_layer, cam_to_pt_layer, cam_edge_layer in zip(
+            self.point_to_camera_layers,
+            self.camera_to_point_layers,
+            self.camera_edge_layers,
         ):
             c2c_edge_hidden = cam_edge_layer(
                 camera_hidden, c2c_edge_index, c2c_edge_hidden
             )
             camera_hidden = pt_cam_layer(
                 camera_hidden, point_hidden, p2c_edge_index, p2c_edge_hidden
+            )
+            point_hidden = cam_to_pt_layer(
+                point_hidden, camera_hidden, c2p_edge_index, c2p_edge_hidden
             )
             c2c_edge_hidden = cam_edge_layer(
                 camera_hidden, c2c_edge_index, c2c_edge_hidden

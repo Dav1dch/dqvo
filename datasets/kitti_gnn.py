@@ -328,4 +328,5 @@ class KITTIFeatureDataset(torch.utils.data.Dataset):
             'abs_poses': abs_poses_4x4,                       # Absolute 4x4 poses for triangulation
             'window_indices': window_indices,
             'K': self.K,
+            'sample_idx': idx,
         }

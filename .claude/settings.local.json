@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 600 python train_gnn_ba.py --checkpoint checkpoints/Exp51/checkpoint_best.pth --sequence 03 --num_epochs 10 --save_dir gnn_ba_output)",
+      "Bash(tee gnn_run.log)",
+      "Bash(python:*)"
+    ]
+  }
+}
