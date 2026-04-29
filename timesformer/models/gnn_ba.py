@@ -190,7 +190,7 @@ class GNNBAOptimizer(nn.Module):
         # Small init keeps initial residual corrections stable.
         nn.init.xavier_uniform_(self.camera_out_proj.weight, gain=0.01)
         nn.init.zeros_(self.camera_out_proj.bias)
-        nn.init.xavier_uniform_(self.point_out_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.point_out_proj.weight, gain=1.0)
         nn.init.zeros_(self.point_out_proj.bias)
         nn.init.xavier_uniform_(self.c2c_pose_out_proj.weight, gain=0.01)
         nn.init.zeros_(self.c2c_pose_out_proj.bias)

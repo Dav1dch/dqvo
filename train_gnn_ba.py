@@ -458,12 +458,14 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 loss_translation = F.mse_loss(pred_rel_poses[:, 3:], gt_rel_norm[:, 3:])
                 pose_loss = loss_angles + loss_translation
 
-                # Point triangulation loss: refined points vs GT triangulated points
+                # Point triangulation loss: refined points vs GT triangulated points.
+                # Sum over 3 coordinates per point, then mean over points — avoids
+                # diluting the gradient by N_pts*3 (keeps it per-point).
                 gt_pts = sd["gt_points_3d"]
                 if gt_pts.numel() > 0 and points_3d_refined.shape[0] == gt_pts.shape[0]:
                     point_loss = huber_loss(
                         points_3d_refined - gt_pts, delta=1.0
-                    ).mean()
+                    ).sum(dim=1).mean()
                 else:
                     point_loss = torch.tensor(0.0, device=device)
 
@@ -1126,6 +1128,7 @@ def main():
         "weighted_loss": args.weighted_loss,
         "reproj_weight": args.reproj_weight,
         "pose_weight": args.pose_weight,
+        "point_weight": args.point_weight,
         "loss_clip": args.loss_clip,
     }
 
@@ -1141,7 +1144,7 @@ def main():
             f"Train Pose = {train_metrics['pose']:.4f}"
         )
 
-        if epoch % 10 == 0:
+        if epoch % 2 == 0:
             val_metrics = validate(vo_model, gnn_model, val_loader, train_args, device, cache)
             print(
                 f"Epoch {epoch}: Train Loss = {train_metrics['total']:.4f}, "

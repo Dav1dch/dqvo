@@ -42,41 +42,6 @@ preprocess = transforms.Compose(
 )
 
 
-def enrich_graph_for_new_gnn(data, relative_pose_features):
-    """Add explicit point->camera and camera->camera edges expected by new GNN."""
-    obs_edge_type = ("camera", "observes", "point")
-    if obs_edge_type in data.edge_types:
-        cam_point_edge_index = data[obs_edge_type].edge_index
-        cam_point_edge_attr = data[obs_edge_type].edge_attr
-        data["point", "observed_by", "camera"].edge_index = torch.stack(
-            [cam_point_edge_index[1], cam_point_edge_index[0]], dim=0
-        )
-        data["point", "observed_by", "camera"].edge_attr = cam_point_edge_attr.clone()
-
-    num_cameras = data["camera"].x.shape[0]
-    num_c2c_edges = max(num_cameras - 1, 0)
-
-    if num_c2c_edges == 0:
-        c2c_edge_index = torch.zeros(2, 0, dtype=torch.long)
-        c2c_edge_attr = torch.zeros(0, 6, dtype=torch.float32)
-    else:
-        src = torch.arange(0, num_c2c_edges, dtype=torch.long)
-        dst = src + 1
-        c2c_edge_index = torch.stack([src, dst], dim=0)
-
-        rel_pose_tensor = torch.as_tensor(relative_pose_features, dtype=torch.float32)
-        if rel_pose_tensor.ndim == 3:
-            rel_pose_tensor = rel_pose_tensor[0]
-
-        c2c_edge_attr = torch.zeros(num_c2c_edges, 6, dtype=torch.float32)
-        usable = min(num_c2c_edges, rel_pose_tensor.shape[0])
-        if usable > 0:
-            c2c_edge_attr[:usable] = rel_pose_tensor[:usable, :6]
-
-    data["camera", "temporal", "camera"].edge_index = c2c_edge_index
-    data["camera", "temporal", "camera"].edge_attr = c2c_edge_attr
-    return data
-
 
 def plot_trajectories(gt_poses, initial_poses, optimized_poses, save_path):
     import matplotlib.pyplot as plt
@@ -224,10 +189,12 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
                 data = build_heterogeneous_graph(
                     window_size, points_3d, graph_obs, img_height, img_width
                 )
-                # Use denormalized absolute poses directly as GNN input
+                # Use denormalized absolute poses directly as GNN input.
+                # GNN resolves c2c edges internally from camera.x (same as
+                # validate() in train_gnn_ba.py and predict_full_sequence()),
+                # computing (abs[i+1]-abs[i]) / std — consistent with training.
                 camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
-                data = enrich_graph_for_new_gnn(data, vo_relative_poses[idx])
                 data = data.to(device)
 
                 with torch.no_grad():
