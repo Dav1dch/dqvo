@@ -223,8 +223,15 @@ def run_gnn_ba(kitti_root: str, sequence: str = '00', num_frames: int = 5,
         return
     print(f"Triangulated {len(points_3d)} points with {len(observations)} observations.")
     
+    # Normalize points for GNN input
+    if not torch.is_tensor(points_3d):
+        points_3d = torch.tensor(points_3d, dtype=torch.float32)
+    pt_mean = points_3d.mean(dim=0)
+    pt_std = points_3d.std(dim=0).clamp_min(1e-6)
+    points_3d_norm = (points_3d - pt_mean) / pt_std
+
     # Build heterogeneous graph (only observation edges)
-    data = build_heterogeneous_graph(num_frames, points_3d, observations, img_height, img_width)
+    data = build_heterogeneous_graph(num_frames, points_3d_norm, observations, img_height, img_width)
     
     # Set camera node features: Euler angles (zyx) + translation from initial poses
     camera_feats = []

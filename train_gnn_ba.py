@@ -201,8 +201,13 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     if len(points_3d) < 10:
                         continue
 
+                    # Normalize point coordinates for stable GNN gradient
+                    pt_mean = points_3d.mean(dim=0)
+                    pt_std = points_3d.std(dim=0).clamp_min(1e-6)
+                    points_3d_norm = (points_3d - pt_mean) / pt_std
+
                     data = build_heterogeneous_graph(
-                        window_size, points_3d, graph_obs, img_height, img_width
+                        window_size, points_3d_norm, graph_obs, img_height, img_width
                     )
                     data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
 
@@ -218,6 +223,8 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                         {
                             "data": data,
                             "points_3d": points_3d,
+                            "pt_mean": pt_mean,
+                            "pt_std": pt_std,
                             "graph_obs": graph_obs,
                             "camera_feats": camera_feats,
                             "gt_rel": gt_relative_poses,
@@ -311,8 +318,13 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     else:
                         points_3d = points_3d.to(device)
 
+                    # Normalize point coordinates for stable GNN gradient
+                    pt_mean = points_3d.mean(dim=0)
+                    pt_std = points_3d.std(dim=0).clamp_min(1e-6)
+                    points_3d_norm = (points_3d - pt_mean) / pt_std
+
                     data = build_heterogeneous_graph(
-                        window_size, points_3d, graph_obs, img_height, img_width
+                        window_size, points_3d_norm, graph_obs, img_height, img_width
                     )
                     data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
 
@@ -351,6 +363,8 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                         {
                             "data": data,
                             "points_3d": points_3d,
+                            "pt_mean": pt_mean,
+                            "pt_std": pt_std,
                             "graph_obs": graph_obs,
                             "camera_feats": camera_feats,
                             "gt_rel": gt_relative_poses,
@@ -396,19 +410,31 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     edge_offset : edge_offset + n_edges_per_sample
                 ]
 
-                # Denormalize predicted relative poses
-                pred_rel_denorm = pred_rel_poses.clone()
-                pred_rel_denorm[:, :3] = (
-                    pred_rel_denorm[:, :3] * std_angles + mean_angles
-                )
-                pred_rel_denorm[:, 3:] = pred_rel_denorm[:, 3:] * std_t + mean_t
-
-                first_pose = torch.tensor(
-                    abs_poses_4x4[0], dtype=torch.float32, device=device
-                )
-                pose_matrices = relative_poses_to_absolute_torch(
-                    pred_rel_denorm, first_pose, device
-                )
+                if pose_weight == 0.0:
+                    # Stage 1: use GT poses for reprojection so geometry is correct
+                    gt_rel = sd["gt_rel"]
+                    if isinstance(gt_rel, np.ndarray) and gt_rel.ndim == 3:
+                        gt_rel = gt_rel[0]
+                    gt_rel_tensor = torch.as_tensor(
+                        gt_rel, dtype=torch.float32, device=device
+                    )
+                    first_pose = torch.eye(4, device=device)
+                    pose_matrices = relative_poses_to_absolute_torch(
+                        gt_rel_tensor, first_pose, device
+                    )
+                else:
+                    # Stage 2: use GNN-predicted poses
+                    pred_rel_denorm = pred_rel_poses.clone()
+                    pred_rel_denorm[:, :3] = (
+                        pred_rel_denorm[:, :3] * std_angles + mean_angles
+                    )
+                    pred_rel_denorm[:, 3:] = pred_rel_denorm[:, 3:] * std_t + mean_t
+                    first_pose = torch.tensor(
+                        abs_poses_4x4[0], dtype=torch.float32, device=device
+                    )
+                    pose_matrices = relative_poses_to_absolute_torch(
+                        pred_rel_denorm, first_pose, device
+                    )
 
                 # Reprojection error using GNN-refined points
                 edge_index = graphs[i]["camera", "observes", "point"].edge_index
@@ -416,9 +442,14 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 u_obs = edge_attr[:, 0] * img_width
                 v_obs = edge_attr[:, 1] * img_height
 
-                # Slice point_refined for this sample
+                # Slice point_refined for this sample (in normalized space)
                 pt_offset = sum(sd["n_pts"] for sd in valid_data[:i])
                 points_3d_refined = point_refined_all[pt_offset : pt_offset + n_pts]
+
+                # Denormalize back to physical coordinates
+                pt_mean = sd["pt_mean"]
+                pt_std = sd["pt_std"]
+                points_3d_refined = points_3d_refined * pt_std + pt_mean
 
                 if points_3d_refined.numel() == 0:
                     edge_offset += n_edges_per_sample
@@ -459,13 +490,12 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 pose_loss = loss_angles + loss_translation
 
                 # Point triangulation loss: refined points vs GT triangulated points.
-                # Sum over 3 coordinates per point, then mean over points — avoids
-                # diluting the gradient by N_pts*3 (keeps it per-point).
+                # .sum() gives O(1) gradient per coordinate (no 1/N dilution).
                 gt_pts = sd["gt_points_3d"]
                 if gt_pts.numel() > 0 and points_3d_refined.shape[0] == gt_pts.shape[0]:
                     point_loss = huber_loss(
                         points_3d_refined - gt_pts, delta=1.0
-                    ).sum(dim=1).mean()
+                    ).sum()
                 else:
                     point_loss = torch.tensor(0.0, device=device)
 
@@ -602,8 +632,15 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                     if len(points_3d) < 10:
                         continue
 
+                # Normalize points for GNN input (match training normalization)
+                if not torch.is_tensor(points_3d):
+                    points_3d = torch.tensor(points_3d, dtype=torch.float32, device=device)
+                pt_mean = points_3d.mean(dim=0)
+                pt_std = points_3d.std(dim=0).clamp_min(1e-6)
+                points_3d_norm = (points_3d - pt_mean) / pt_std
+
                 data = build_heterogeneous_graph(
-                    window_size, points_3d, graph_obs, img_height, img_width
+                    window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
 
                 abs_poses_6dof = []
@@ -665,6 +702,8 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
 
 
 def plot_trajectories(gt_poses, initial_poses, optimized_poses, save_path):
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     gt_positions = np.array([p[:3, 3] for p in gt_poses])
@@ -825,10 +864,17 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
             )
 
             if len(points_3d) >= 10:
+                # Normalize points for GNN input
+                if not torch.is_tensor(points_3d):
+                    points_3d = torch.tensor(points_3d, dtype=torch.float32, device=device)
+                pt_mean = points_3d.mean(dim=0)
+                pt_std = points_3d.std(dim=0).clamp_min(1e-6)
+                points_3d_norm = (points_3d - pt_mean) / pt_std
+
                 # Original image dimensions for graph normalization
                 img_height, img_width = sample["images"][0].shape[:2]
                 data = build_heterogeneous_graph(
-                    window_size, points_3d, graph_obs, img_height, img_width
+                    window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
 
                 # Use accumulated absolute poses as GNN input (like validate)
@@ -1167,6 +1213,7 @@ def main():
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=remaining, eta_min=args.lr * 0.1
             )
+            train_args["reproj_weight"] = args.reproj_weight
             train_args["pose_weight"] = args.pose_weight
             in_stage1 = False
             print(f"*** Transitioned to Stage 2 at epoch {epoch} (unfrozen all, remaining={remaining}) ***")
@@ -1242,8 +1289,13 @@ def main():
     img_height, img_width = test_sample["images"][0].shape[:2]
 
     points_3d, graph_obs, _ = triangulate_all_points(tracks, vo_poses, K)
+    if not torch.is_tensor(points_3d):
+        points_3d = torch.tensor(points_3d, dtype=torch.float32)
+    pt_mean = points_3d.mean(dim=0)
+    pt_std = points_3d.std(dim=0).clamp_min(1e-6)
+    points_3d_norm = (points_3d - pt_mean) / pt_std
     data = build_heterogeneous_graph(
-        args.window_size, points_3d, graph_obs, img_height, img_width
+        args.window_size, points_3d_norm, graph_obs, img_height, img_width
     )
 
     # Convert 4x4 absolute poses to 6-DOF (denorm) — use directly as GNN input

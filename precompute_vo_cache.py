@@ -60,6 +60,10 @@ def precompute_window(vo_model, dataset, idx, window_size, device):
     gt_relative_poses = sample["global_poses"]
     img_height, img_width = images[0].shape[:2]
 
+    # Make GT poses relative to first camera frame (match VO coordinate frame)
+    T_inv = np.linalg.inv(gt_abs_poses[0])
+    gt_abs_poses_rel = [T_inv @ p for p in gt_abs_poses]
+
     if len(tracks) < 10:
         return None
 
@@ -122,7 +126,7 @@ def precompute_window(vo_model, dataset, idx, window_size, device):
 
     # GT triangulation (same tracks, no cheirality filter)
     gt_points_3d = triangulate_tracks_no_filter(
-        tracks, valid_tracks, gt_abs_poses, K, device="cpu"
+        tracks, valid_tracks, gt_abs_poses_rel, K, device="cpu"
     )
     if not torch.is_tensor(gt_points_3d):
         gt_points_3d = torch.tensor(gt_points_3d, dtype=torch.float32)
