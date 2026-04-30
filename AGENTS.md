@@ -41,7 +41,7 @@ python plot_results.py       # Trajectory visualization (edit paths)
 
 - **Most scripts**: inline Python `dict`s (not argparse). Edit `args` and `model_params` directly in `train.py` and `predict_poses.py`.
 - **Exception**: `train_gnn_ba.py`, `inference_gnn_ba.py`, and `gnn_ba_test.py` use `argparse`. Run `python train_gnn_ba.py --help` to see options.
-- **GNN defaults** (train_gnn_ba.py): `hidden_dim=128`, `num_layers=6`, `lr=1e-4`, `window_size=3`, `overlap=2`, `batch_size=16`, `reproj_weight=0.01`, `pose_weight=1.0`, `point_weight=0.1`, `weighted_loss=10.0`, `save_dir=gnn_ba_output`.
+- **GNN defaults** (train_gnn_ba.py): `hidden_dim=128`, `num_layers=6`, `lr=1e-4`, `window_size=3`, `overlap=2`, `batch_size=16`, `reproj_weight=0.01`, `pose_weight=1.0`, `point_weight=0.1`, `weighted_loss=3.0`, `save_dir=gnn_ba_output`.
 - **VO model config** is hardcoded in `train_gnn_ba.py` (lines 867–880): `dim=384`, `depth=16`, `heads=6`, `image_size=(224, 672)`, `patch_size=16`.
 - **Typecheck**: `basedpyright` in standard mode (`pyproject.toml`). Run `basedpyright` to typecheck, though the codebase has no type hints — expect many findings.
 
@@ -60,11 +60,23 @@ data/
 ## Training Behavior (train_gnn_ba.py)
 
 - **VO model is frozen** (eval mode, no gradients). Only GNN parameters are optimized.
+- **Dropout (0.1)** applied to all GNN message/update networks. Output projection layers have **no bias** (`bias=False`).
+- **Loss**: `reproj_weight × Huber(reprojection_error) + pose_weight × [k × MSE(angles) + MSE(translation)] + point_weight × Huber(refined_points - GT_triangulated_points) + 0.01 × ||mean(pred_rel_poses)||`. Batches with `loss > loss_clip` are skipped.
 - **Validation** runs every 10 epochs. Metrics: initial vs optimized reprojection error (pixels).
 - **Best model** saved as `gnn_ba_output/gnn_ba_best.pth` (lowest val error).
 - **DataLoader**: `num_workers=16`, custom `collate_fn` for variable-size tracks/observations.
-- **Loss**: `reproj_weight × Huber(reprojection_error) + pose_weight × SmoothL1(GNN_rel_poses, GT_rel_poses) + point_weight × Huber(refined_points - GT_triangulated_points)`. Batches with `loss > loss_clip` are skipped.
 - **Deterministic training** enabled by default (`torch.backends.cudnn.deterministic=True`).
+
+## Two-Stage Training
+
+Use `--stage1_epochs` to run a single training session that transitions from point-only (stage 1) to full training (stage 2) automatically:
+
+```bash
+# 30 epochs of point refinement, then 70 epochs of full training
+python train_gnn_ba.py --stage1_epochs 30 --num_epochs 100 [other args]
+```
+
+Stage 1 freezes pose output layers (`c2c_pose_out_proj` + `camera_out_proj`) and sets `pose_weight=0`, so only point/feature parameters receive gradients. The reprojection loss (with frozen poses) and point triangulation loss drive point refinement. At epoch `stage1_epochs+1`, all layers are unfrozen, the optimizer is re-created, and full training resumes with all losses. The LR scheduler resets its cosine annealing over the remaining epochs.
 
 ## Inference Notes
 

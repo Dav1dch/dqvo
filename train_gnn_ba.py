@@ -475,10 +475,13 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
 
                 reproj_loss = huber_loss(valid_errors, delta=5.0).mean()
                 point_weight = args.get("point_weight", 1.0)
+                # Mean-pose regularization (gated by pose_weight to avoid gradient leakage in stage 1)
+                mean_pose_reg = 0.01 * pred_rel_poses.mean(dim=0).norm() * pose_weight
                 loss = (
                     reproj_loss * reproj_weight
                     + pose_loss * pose_weight
                     + point_loss * point_weight
+                    + mean_pose_reg
                 )
 
                 if not torch.isfinite(loss):
@@ -922,8 +925,8 @@ def main():
     parser.add_argument(
         "--weighted_loss",
         type=float,
-        default=10.0,
-        help="Weight for pose supervision loss",
+        default=3.0,
+        help="Weight for angle part of pose supervision loss",
     )
     parser.add_argument(
         "--reproj_weight",
@@ -986,6 +989,13 @@ def main():
         type=str,
         default=None,
         help="Path to pre-computed VO cache file (skips VO forward + triangulation)",
+    )
+    parser.add_argument(
+        "--stage1_epochs",
+        type=int,
+        default=0,
+        help="Number of epochs for stage 1 (point-only, pose output frozen). "
+             "After this, transitions to stage 2 (full training). 0 = no stage 1.",
     )
 
     args = parser.parse_args()
@@ -1094,7 +1104,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=8,
         collate_fn=collate_fn,
         persistent_workers=True,
@@ -1111,9 +1121,22 @@ def main():
     gnn_model = GNNBAOptimizer(
         hidden_dim=args.hidden_dim, num_layers=args.num_layers
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        gnn_model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
+
+    in_stage1 = args.stage1_epochs > 0
+
+    if in_stage1:
+        for name, param in gnn_model.named_parameters():
+            if "c2c_pose_out_proj" in name or "camera_out_proj" in name:
+                param.requires_grad = False
+        print(f"Stage 1 enabled: first {args.stage1_epochs} epochs freeze pose output layers")
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, gnn_model.parameters()),
+            lr=args.lr, weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            gnn_model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.num_epochs, eta_min=args.lr * 0.1
     )
@@ -1127,12 +1150,27 @@ def main():
         "overlap": args.overlap,
         "weighted_loss": args.weighted_loss,
         "reproj_weight": args.reproj_weight,
-        "pose_weight": args.pose_weight,
+        "pose_weight": 0.0 if in_stage1 else args.pose_weight,
         "point_weight": args.point_weight,
         "loss_clip": args.loss_clip,
     }
 
     for epoch in range(1, args.num_epochs + 1):
+        if in_stage1 and epoch == args.stage1_epochs + 1:
+            # Transition to stage 2: unfreeze all, re-create optimizer and scheduler
+            for name, param in gnn_model.named_parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.AdamW(
+                gnn_model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+            )
+            remaining = args.num_epochs - epoch + 1
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining, eta_min=args.lr * 0.1
+            )
+            train_args["pose_weight"] = args.pose_weight
+            in_stage1 = False
+            print(f"*** Transitioned to Stage 2 at epoch {epoch} (unfrozen all, remaining={remaining}) ***")
+
         train_metrics = train_epoch(
             vo_model, gnn_model, train_loader, optimizer, epoch, train_args, device, cache
         )

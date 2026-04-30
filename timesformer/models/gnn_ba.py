@@ -23,20 +23,25 @@ class PointToCameraLayer(nn.Module):
     Uses LayerNorm + residual connection for deeper architectures.
     """
 
-    def __init__(self, hidden_dim, edge_dim):
+    def __init__(self, hidden_dim, edge_dim, dropout=0.1):
         super().__init__()
+        self.dropout = nn.Dropout(dropout)
         self.msg_net = nn.Sequential(
             nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.update_net = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.norm = nn.LayerNorm(hidden_dim)
@@ -66,20 +71,25 @@ class CameraToPointLayer(nn.Module):
     Uses LayerNorm + residual connection for deeper architectures.
     """
 
-    def __init__(self, hidden_dim, edge_dim):
+    def __init__(self, hidden_dim, edge_dim, dropout=0.1):
         super().__init__()
+        self.dropout = nn.Dropout(dropout)
         self.msg_net = nn.Sequential(
             nn.Linear(hidden_dim * 2 + edge_dim, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.update_net = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.norm = nn.LayerNorm(hidden_dim)
@@ -108,13 +118,16 @@ class CameraEdgeUpdateLayer(nn.Module):
     Uses LayerNorm + residual connection for deeper architectures.
     """
 
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, dropout=0.1):
         super().__init__()
+        self.dropout = nn.Dropout(dropout)
         self.edge_update = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            self.dropout,
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.norm = nn.LayerNorm(hidden_dim)
@@ -158,6 +171,7 @@ class GNNBAOptimizer(nn.Module):
         point_feat_dim=3,
         p2c_edge_dim=2,
         c2c_edge_dim=6,
+        dropout=0.1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -173,27 +187,24 @@ class GNNBAOptimizer(nn.Module):
         self.c2c_edge_embed = nn.Linear(c2c_edge_dim, hidden_dim)
 
         self.point_to_camera_layers = nn.ModuleList(
-            [PointToCameraLayer(hidden_dim, hidden_dim) for _ in range(num_layers)]
+            [PointToCameraLayer(hidden_dim, hidden_dim, dropout) for _ in range(num_layers)]
         )
         self.camera_to_point_layers = nn.ModuleList(
-            [CameraToPointLayer(hidden_dim, hidden_dim) for _ in range(num_layers)]
+            [CameraToPointLayer(hidden_dim, hidden_dim, dropout) for _ in range(num_layers)]
         )
         self.camera_edge_layers = nn.ModuleList(
-            [CameraEdgeUpdateLayer(hidden_dim) for _ in range(num_layers)]
+            [CameraEdgeUpdateLayer(hidden_dim, dropout) for _ in range(num_layers)]
         )
 
-        # Compatibility heads
-        self.camera_out_proj = nn.Linear(hidden_dim, 6)
-        self.point_out_proj = nn.Linear(hidden_dim, 3)
-        self.c2c_pose_out_proj = nn.Linear(hidden_dim, 6)
+        # Compatibility heads (no bias — learnable bias creates systematic drift)
+        self.camera_out_proj = nn.Linear(hidden_dim, 6, bias=False)
+        self.point_out_proj = nn.Linear(hidden_dim, 3, bias=False)
+        self.c2c_pose_out_proj = nn.Linear(hidden_dim, 6, bias=False)
 
         # Small init keeps initial residual corrections stable.
         nn.init.xavier_uniform_(self.camera_out_proj.weight, gain=0.01)
-        nn.init.zeros_(self.camera_out_proj.bias)
         nn.init.xavier_uniform_(self.point_out_proj.weight, gain=1.0)
-        nn.init.zeros_(self.point_out_proj.bias)
         nn.init.xavier_uniform_(self.c2c_pose_out_proj.weight, gain=0.01)
-        nn.init.zeros_(self.c2c_pose_out_proj.bias)
 
     def _resolve_p2c_edges(self, data):
         """
