@@ -398,7 +398,7 @@ class GNNBAOptimizer(nn.Module):
 
         if output_mode == "relative":
             c2c_delta = self.c2c_pose_out_proj(c2c_edge_hidden)
-            camera_relative = c2c_delta  # GNN directly outputs optimized relative pose
+            camera_relative = c2c_edge_attr + c2c_delta  # residual: noisy input + correction
             return camera_relative, point_refined
 
         raise ValueError(f"Unsupported output_mode: {output_mode}")

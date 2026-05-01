@@ -196,12 +196,16 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
                 data = build_heterogeneous_graph(
                     window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
-                # Use denormalized absolute poses directly as GNN input.
-                # GNN resolves c2c edges internally from camera.x (same as
-                # validate() in train_gnn_ba.py and predict_full_sequence()),
-                # computing (abs[i+1]-abs[i]) / std — consistent with training.
+                # Use denormalized absolute poses as GNN input
                 camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
+                # c2c edges: use exact VO relative pose (already normalized)
+                c2c_index = torch.stack([
+                    torch.arange(0, window_size - 1), torch.arange(1, window_size)
+                ], dim=0)
+                c2c_attr = torch.tensor(vo_relative_poses[idx], dtype=torch.float32)
+                data["camera", "temporal", "camera"].edge_index = c2c_index
+                data["camera", "temporal", "camera"].edge_attr = c2c_attr
                 data = data.to(device)
 
                 with torch.no_grad():

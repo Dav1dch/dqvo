@@ -211,10 +211,15 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     )
                     data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
 
-                    cam_feats_t = data["camera"].x
-                    c2c_index, c2c_attr = compute_normalized_c2c_edges(
-                        cam_feats_t, window_size
-                    )
+                    # c2c edges: prefer exact VO relative poses from cache, fall back to diffs
+                    c2c_index = torch.stack([
+                        torch.arange(0, window_size - 1), torch.arange(1, window_size)
+                    ], dim=0)
+                    if "vo_rel_poses" in c:
+                        c2c_attr = torch.tensor(c["vo_rel_poses"], dtype=torch.float32)
+                    else:
+                        cam_feats_t = data["camera"].x
+                        _, c2c_attr = compute_normalized_c2c_edges(cam_feats_t, window_size)
                     data["camera", "temporal", "camera"].edge_index = c2c_index
                     data["camera", "temporal", "camera"].edge_attr = c2c_attr
                     data = data.to(device)
@@ -328,15 +333,12 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     )
                     data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
 
-                    # Explicit camera-to-camera chain edges (prevents cross-sample
-                    # edges when PyG batches the graphs). Normalize pose differences
-                    # so the GNN output matches normalized GT.
-                    cam_feats_t = data["camera"].x
-                    c2c_index, c2c_attr = compute_normalized_c2c_edges(
-                        cam_feats_t, window_size
-                    )
+                    # c2c edges: use EXACT VO-predicted relative pose (already normalized)
+                    c2c_index = torch.stack([
+                        torch.arange(0, window_size - 1), torch.arange(1, window_size)
+                    ], dim=0)
                     data["camera", "temporal", "camera"].edge_index = c2c_index
-                    data["camera", "temporal", "camera"].edge_attr = c2c_attr
+                    data["camera", "temporal", "camera"].edge_attr = torch.tensor(vo_out, dtype=torch.float32)
                     data = data.to(device)
 
                     # GT triangulation for point supervision (same tracks, no cheirality filter).
@@ -490,12 +492,11 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 pose_loss = loss_angles + loss_translation
 
                 # Point triangulation loss: refined points vs GT triangulated points.
-                # .sum() gives O(1) gradient per coordinate (no 1/N dilution).
                 gt_pts = sd["gt_points_3d"]
                 if gt_pts.numel() > 0 and points_3d_refined.shape[0] == gt_pts.shape[0]:
                     point_loss = huber_loss(
                         points_3d_refined - gt_pts, delta=1.0
-                    ).sum()
+                    ).mean()
                 else:
                     point_loss = torch.tensor(0.0, device=device)
 
@@ -605,6 +606,7 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                     vo_poses = c["vo_abs_poses_4x4"]
                     points_3d = c["points_3d"]
                     graph_obs = c["graph_obs"]
+                    vo_rel = c.get("vo_rel_poses", None)  # may not exist in old caches
                 else:
                     # Preprocess images
                     pil_images = []
@@ -621,6 +623,7 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                     )
 
                     vo_output = model(imgs_batch)
+                    vo_rel = vo_output.detach().cpu()[0]  # (window_size-1, 6) normalized
                     vo_poses = denormalize_poses(
                         vo_output, window_size, mean_angles, std_angles, mean_t, std_t
                     )[0]
@@ -634,7 +637,8 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
 
                 # Normalize points for GNN input (match training normalization)
                 if not torch.is_tensor(points_3d):
-                    points_3d = torch.tensor(points_3d, dtype=torch.float32, device=device)
+                    points_3d = torch.tensor(points_3d, dtype=torch.float32)
+                points_3d = points_3d.to(device)
                 pt_mean = points_3d.mean(dim=0)
                 pt_std = points_3d.std(dim=0).clamp_min(1e-6)
                 points_3d_norm = (points_3d - pt_mean) / pt_std
@@ -656,6 +660,14 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                 # Use denormalized absolute poses directly as GNN input
                 camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
+
+                # c2c edges: use exact VO relative poses if available, else fall back
+                c2c_index = torch.stack([
+                    torch.arange(0, window_size - 1), torch.arange(1, window_size)
+                ], dim=0)
+                if vo_rel is not None:
+                    data["camera", "temporal", "camera"].edge_index = c2c_index
+                    data["camera", "temporal", "camera"].edge_attr = vo_rel.clone().detach()
                 data = data.to(device)
 
                 pred_rel_poses, point_refined = gnn_model(data, output_mode="relative")
@@ -675,11 +687,13 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                 opt_abs_T = relative_poses_to_absolute_torch(
                     pred_rel_poses_denorm, first_pose_tensor, device
                 )
-                opt_points_np = point_refined.cpu().numpy()
                 opt_abs_np = opt_abs_T.cpu().numpy()
                 opt_poses = [opt_abs_np[i] for i in range(window_size)]
 
-                # Use same triangulated points for both errors
+                # Denormalize GNN-refined points for optimized error
+                point_refined_denorm = point_refined * pt_std + pt_mean
+                opt_points_np = point_refined_denorm.cpu().numpy()
+
                 if torch.is_tensor(points_3d):
                     points_3d_np = points_3d.cpu().numpy()
                 else:
@@ -688,7 +702,7 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                     vo_poses, points_3d_np, graph_obs, K, img_height, img_width
                 )
                 optimized_error = compute_reprojection_error(
-                    opt_poses, points_3d_np, graph_obs, K, img_height, img_width
+                    opt_poses, opt_points_np, graph_obs, K, img_height, img_width
                 )
 
                 total_error_initial += initial_error
@@ -893,9 +907,11 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
                 camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
 
-                # Explicit normalized c2c edges (matches training)
-                cam_x = data["camera"].x
-                c2c_index, c2c_attr = compute_normalized_c2c_edges(cam_x, window_size)
+                # Explicit c2c edges using raw VO output (already normalized)
+                c2c_index = torch.stack([
+                    torch.arange(0, window_size - 1), torch.arange(1, window_size)
+                ], dim=0)
+                c2c_attr = torch.tensor(raw_vo_outputs[idx], dtype=torch.float32)
                 data["camera", "temporal", "camera"].edge_index = c2c_index
                 data["camera", "temporal", "camera"].edge_attr = c2c_attr
                 data = data.to(device)
@@ -950,6 +966,142 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     return vo_poses, opt_poses_full
 
 
+def build_vo_cache(vo_model, dataset, args, device, cache_path):
+    """Pre-compute VO forward + triangulation for all windows and save to disk."""
+    vo_model.eval()
+    window_size = args.window_size
+
+    mean_angles_np = KITTI_MEAN_ANGLES.copy()
+    std_angles_np = KITTI_STD_ANGLES.copy()
+    mean_t_np = KITTI_MEAN_T.copy()
+    std_t_np = KITTI_STD_T.copy()
+
+    cache = {}
+    batch_size = 16
+    total = len(dataset)
+    print(f"\nBuilding VO cache ({total} windows) → {cache_path}")
+    print("  Step 1: Running VO model on all windows...")
+
+    # Collect all VO outputs in batches
+    vo_outputs = {}  # idx -> numpy array (window_size-1, 6)
+
+    indices = list(range(total))
+    for start in tqdm(range(0, total, batch_size), desc="VO forward"):
+        end = min(start + batch_size, total)
+        batch_indices = indices[start:end]
+
+        # Preprocess images for this batch
+        all_pil_stacks = []
+        all_img_dims = []
+        for idx in batch_indices:
+            sample = dataset[idx]
+            images = sample["images"]
+            pil_images = []
+            for img in images:
+                if isinstance(img, torch.Tensor):
+                    img = img.squeeze(0).numpy()
+                if len(img.shape) == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                pil_images.append(preprocess(Image.fromarray(img)))
+            all_pil_stacks.append(torch.stack(pil_images, dim=1).squeeze(0))
+            all_img_dims.append(images[0].shape[:2])
+
+        vo_imgs = torch.stack(all_pil_stacks, dim=0).to(device)
+        with torch.no_grad():
+            vo_output_all = vo_model(vo_imgs)  # (B, window_size-1, 6)
+        vo_output_np = vo_output_all.cpu().numpy()
+
+        for j, idx in enumerate(batch_indices):
+            vo_outputs[idx] = vo_output_np[j]
+
+    print(f"  Step 2: Triangulating 3D points...")
+
+    for idx in tqdm(range(total), desc="Triangulation"):
+        sample = dataset[idx]
+        K = sample["K"]
+        tracks = sample["tracks"]
+        gt_abs = sample["abs_poses"]
+
+        vo_out = vo_outputs[idx]  # (window_size-1, 6) normalized
+
+        # Denormalize and accumulate to absolute 4x4
+        rel_poses_denorm = []
+        for i in range(vo_out.shape[0]):
+            euler = vo_out[i, :3] * std_angles_np + mean_angles_np
+            t = vo_out[i, 3:] * std_t_np + mean_t_np
+            rel_poses_denorm.append(np.concatenate([euler, t]))
+
+        abs_poses_4x4 = [np.eye(4)]
+        for rel_pose in rel_poses_denorm:
+            R = euler_to_rotation(rel_pose[:3], seq="zyx")
+            T_rel = np.eye(4)
+            T_rel[:3, :3] = R
+            T_rel[:3, 3] = rel_pose[3:]
+            abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
+
+        # Camera features: absolute 6-DOF (denorm)
+        abs_poses_6dof = []
+        for pose in abs_poses_4x4:
+            R = pose[:3, :3]
+            t = pose[:3, 3]
+            euler = rotation_to_euler(R, seq="zyx")
+            abs_poses_6dof.append(np.concatenate([euler, t]))
+        camera_feats = np.array(abs_poses_6dof)
+
+        if len(tracks) < 10:
+            cache[idx] = {
+                "vo_camera_feats": camera_feats,
+                "vo_rel_poses": vo_out,
+                "points_3d": np.zeros((0, 3)),
+                "graph_obs": [],
+                "gt_points_3d": np.zeros((0, 3)),
+                "vo_abs_poses_4x4": abs_poses_4x4,
+            }
+            continue
+
+        # Triangulate from VO absolute poses
+        points_3d, graph_obs, valid_tracks = triangulate_all_points(
+            tracks, abs_poses_4x4, K
+        )
+
+        if len(points_3d) < 10:
+            if isinstance(points_3d, torch.Tensor):
+                points_3d = points_3d.cpu().numpy()
+            cache[idx] = {
+                "vo_camera_feats": camera_feats,
+                "vo_rel_poses": vo_out,
+                "points_3d": points_3d if isinstance(points_3d, np.ndarray) else np.array(points_3d),
+                "graph_obs": graph_obs,
+                "gt_points_3d": np.zeros((0, 3)),
+                "vo_abs_poses_4x4": abs_poses_4x4,
+            }
+            continue
+
+        # GT triangulation for point supervision
+        T_inv = np.linalg.inv(gt_abs[0])
+        gt_abs_rel = [T_inv @ p for p in gt_abs]
+        gt_points_3d = triangulate_tracks_no_filter(
+            tracks, valid_tracks, gt_abs_rel, K, device="cpu"
+        )
+        if isinstance(gt_points_3d, torch.Tensor):
+            gt_points_3d = gt_points_3d.cpu().numpy()
+        if isinstance(points_3d, torch.Tensor):
+            points_3d = points_3d.cpu().numpy()
+
+        cache[idx] = {
+            "vo_camera_feats": camera_feats,
+            "vo_rel_poses": vo_out,
+            "points_3d": points_3d,
+            "graph_obs": graph_obs,
+            "gt_points_3d": gt_points_3d,
+            "vo_abs_poses_4x4": abs_poses_4x4,
+        }
+
+    torch.save(cache, cache_path)
+    n_valid = sum(1 for c in cache.values() if len(c["points_3d"]) >= 10)
+    print(f"  Cache saved: {len(cache)} windows ({n_valid} valid) → {cache_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train GNN-based BA")
     parser.add_argument(
@@ -958,7 +1110,11 @@ def main():
         default="checkpoints/Exp51/checkpoint_best.pth",
         help="Path to VO model checkpoint",
     )
-    parser.add_argument("--sequence", type=str, default="03", help="Sequence number")
+    parser.add_argument("--sequence", type=str, default="03", help="Single sequence (overridden by --train_seqs)")
+    parser.add_argument("--train_seqs", type=str, default=None,
+                        help="Comma-separated training sequences, e.g. 00,02,08,09")
+    parser.add_argument("--test_seqs", type=str, default=None,
+                        help="Comma-separated test sequences for final evaluation")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension")
     parser.add_argument(
@@ -977,7 +1133,7 @@ def main():
     parser.add_argument(
         "--reproj_weight",
         type=float,
-        default=0.1,
+        default=0.01,
         help="Weight for reprojection loss term",
     )
     parser.add_argument(
@@ -989,7 +1145,7 @@ def main():
     parser.add_argument(
         "--point_weight",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Weight for GT triangulation point loss",
     )
     parser.add_argument(
@@ -1035,6 +1191,12 @@ def main():
         type=str,
         default=None,
         help="Path to pre-computed VO cache file (skips VO forward + triangulation)",
+    )
+    parser.add_argument(
+        "--build_cache",
+        type=str,
+        default=None,
+        help="Build VO cache file at PATH, then exit (no training)",
     )
     parser.add_argument(
         "--stage1_epochs",
@@ -1087,23 +1249,45 @@ def main():
     vo_model.eval()
     print("VO model loaded successfully")
 
-    print(f"\nLoading KITTI dataset for sequence {args.sequence}...")
-    full_dataset = KITTIFeatureDataset(
-        data_path=args.data_path,
-        gt_path=args.gt_path,
-        sequence=args.sequence,
-        window_size=args.window_size,
-        overlap=args.overlap,
-        max_points=200,
-    )
+    # ---- Dataset loading ----
+    if args.train_seqs is not None:
+        train_seq_list = [s.strip() for s in args.train_seqs.split(",")]
+        print(f"\nLoading KITTI datasets for training sequences: {train_seq_list}...")
+        seq_datasets = []
+        for seq in train_seq_list:
+            ds = KITTIFeatureDataset(
+                data_path=args.data_path, gt_path=args.gt_path,
+                sequence=seq, window_size=args.window_size,
+                overlap=args.overlap, max_points=200,
+            )
+            print(f"  Seq {seq}: {len(ds)} windows")
+            seq_datasets.append(ds)
+        full_dataset = torch.utils.data.ConcatDataset(seq_datasets)
+        print(f"Combined training dataset: {len(full_dataset)} windows")
+    else:
+        print(f"\nLoading KITTI dataset for sequence {args.sequence}...")
+        full_dataset = KITTIFeatureDataset(
+            data_path=args.data_path,
+            gt_path=args.gt_path,
+            sequence=args.sequence,
+            window_size=args.window_size,
+            overlap=args.overlap,
+            max_points=200,
+        )
+        print(f"Dataset size: {len(full_dataset)} windows")
 
     if args.debug:
-        print(f"Debug mode: limiting dataset to first 100 windows")
+        print("Debug mode: limiting dataset to first 100 windows")
         full_dataset = torch.utils.data.Subset(
             full_dataset, list(range(min(100, len(full_dataset))))
         )
+        print(f"Debug dataset size: {len(full_dataset)} windows")
 
-    print(f"Dataset size: {len(full_dataset)} windows")
+    # ---- Build cache and exit ----
+    if args.build_cache is not None:
+        build_vo_cache(vo_model, full_dataset, args, device, args.build_cache)
+        print("\nCache built. Re-run with --cache to use it.")
+        return
 
     # Load cache if provided
     cache = None
@@ -1112,12 +1296,8 @@ def main():
         cache = torch.load(args.cache, map_location="cpu")
         print(f"Cache loaded: {len(cache)} windows")
 
-    # For Subset, gt_poses come from underlying dataset
-    gt_poses = (
-        full_dataset.dataset.gt_poses
-        if isinstance(full_dataset, torch.utils.data.Subset)
-        else full_dataset.gt_poses
-    )
+    # gt_poses for final evaluation (not needed during training)
+    gt_poses = None  # multi-sequence: evaluated per test sequence
 
     num_val = max(1, int(len(full_dataset) * args.val_split))
     train_size = max(1, len(full_dataset) - num_val)
@@ -1150,7 +1330,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=8,
         collate_fn=collate_fn,
         persistent_workers=True,
@@ -1250,154 +1430,84 @@ def main():
                 )
                 print(f"Saved best model with error: {best_val_error:.2f}px")
 
-    print("\nTraining completed! Running final evaluation...")
+    print("\nTraining completed!")
 
-    final_metrics = validate(vo_model, gnn_model, val_loader, train_args, device, cache)
-    print(f'Final Initial Error: {final_metrics["initial_error"]:.2f}px')
-    print(f'Final Optimized Error: {final_metrics["optimized_error"]:.2f}px')
+    # ---- Evaluate on test sequences ----
+    test_seq_list = None
+    if args.test_seqs is not None:
+        test_seq_list = [s.strip() for s in args.test_seqs.split(",")]
+    elif args.train_seqs is None:
+        test_seq_list = [args.sequence]
 
-    print("\nGenerating trajectory comparison...")
+    if test_seq_list is not None:
+        print(f"\nEvaluating on test sequences: {test_seq_list}")
+        all_ate = {}
+        for seq in test_seq_list:
+            print(f"\n--- Sequence {seq} ---")
+            test_ds = KITTIFeatureDataset(
+                data_path=args.data_path, gt_path=args.gt_path,
+                sequence=seq, window_size=args.window_size,
+                overlap=args.overlap, max_points=200,
+            )
+            vo_poses, opt_poses = predict_full_sequence(
+                vo_model, gnn_model, test_ds, train_args, device
+            )
 
-    test_sample = full_dataset[0]
-    window_indices = test_sample["window_indices"]
+            # Compute ATE
+            gt_raw = test_ds.gt_poses
+            gt_pos = np.array([p[:3, 3] for p in gt_raw])
+            vo_pos = np.array([p[:3, 3] for p in vo_poses])
+            opt_pos = np.array([p[:3, 3] for p in opt_poses])
+            n = min(len(gt_pos), len(vo_pos), len(opt_pos))
+            ate = np.sqrt(np.mean(np.sum((gt_pos[:n] - opt_pos[:n]) ** 2, axis=1)))
+            ate_vo = np.sqrt(np.mean(np.sum((gt_pos[:n] - vo_pos[:n]) ** 2, axis=1)))
+            all_ate[seq] = (ate_vo, ate)
 
-    pil_images = []
-    for img in test_sample["images"]:
-        if len(img.shape) == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        pil_img = Image.fromarray(img)
-        pil_images.append(preprocess(pil_img))
+            # Save poses
+            vo_path = os.path.join(args.save_dir, f"poses_{seq}_vo.txt")
+            opt_path = os.path.join(args.save_dir, f"poses_{seq}_opt.txt")
+            with open(vo_path, "w") as f:
+                for p in vo_poses:
+                    f.write(" ".join(f"{v:.6f}" for v in np.concatenate([p[:3, :3].flatten(), p[:3, 3]])) + "\n")
+            with open(opt_path, "w") as f:
+                for p in opt_poses:
+                    f.write(" ".join(f"{v:.6f}" for v in np.concatenate([p[:3, :3].flatten(), p[:3, 3]])) + "\n")
 
-    sample_images = torch.stack(pil_images, dim=1).squeeze(0).unsqueeze(0).to(device)
+            # Plot
+            try:
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.plot(gt_pos[:, 0], gt_pos[:, 2], "b-", label="GT", lw=1.5)
+                ax.plot(vo_pos[:, 0], vo_pos[:, 2], "r--", label=f"VO (ATE={ate_vo:.2f}m)", lw=1, alpha=0.5)
+                ax.plot(opt_pos[:, 0], opt_pos[:, 2], "g-", label=f"GNN (ATE={ate:.2f}m)", lw=1.5)
+                ax.set_title(f"Seq {seq} — VO={ate_vo:.2f}m  GNN={ate:.2f}m")
+                ax.legend(); ax.grid(True); ax.axis("equal")
+                plt.savefig(os.path.join(args.save_dir, f"traj_{seq}.pdf"), dpi=150, bbox_inches="tight")
+                plt.close()
+            except Exception:
+                pass
 
-    with torch.no_grad():
-        vo_output = vo_model(sample_images)
+            print(f"  VO ATE: {ate_vo:.4f}m  |  GNN ATE: {ate:.4f}m")
 
-    vo_poses = denormalize_poses(
-        vo_output,
-        args.window_size,
-        KITTI_MEAN_ANGLES,
-        KITTI_STD_ANGLES,
-        KITTI_MEAN_T,
-        KITTI_STD_T,
-    )[0]
+        # Summary
+        print("\n" + "=" * 55)
+        print("ATE SUMMARY")
+        print("=" * 55)
+        print(f"  {'Seq':>5}  {'VO ATE':>8}  {'GNN ATE':>8}  {'Δ':>8}")
+        print("  " + "-" * 40)
+        ate_vo_list, ate_gnn_list = [], []
+        for seq, (vo_a, gnn_a) in all_ate.items():
+            delta = vo_a - gnn_a
+            print(f"  {seq:>5}  {vo_a:>8.4f}  {gnn_a:>8.4f}  {delta:>+8.4f}")
+            ate_vo_list.append(vo_a)
+            ate_gnn_list.append(gnn_a)
+        print("  " + "-" * 40)
+        print(f"  Mean:  {np.mean(ate_vo_list):>8.4f}  {np.mean(ate_gnn_list):>8.4f}  {np.mean(ate_vo_list)-np.mean(ate_gnn_list):>+8.4f}")
+        print(f"  Median:{np.median(ate_vo_list):>8.4f}  {np.median(ate_gnn_list):>8.4f}  {np.median(ate_vo_list)-np.median(ate_gnn_list):>+8.4f}")
 
-    tracks = test_sample["tracks"]
-    K = test_sample["K"]
-
-    # Use original K and actual image dimensions
-    img_height, img_width = test_sample["images"][0].shape[:2]
-
-    points_3d, graph_obs, _ = triangulate_all_points(tracks, vo_poses, K)
-    if not torch.is_tensor(points_3d):
-        points_3d = torch.tensor(points_3d, dtype=torch.float32)
-    pt_mean = points_3d.mean(dim=0)
-    pt_std = points_3d.std(dim=0).clamp_min(1e-6)
-    points_3d_norm = (points_3d - pt_mean) / pt_std
-    data = build_heterogeneous_graph(
-        args.window_size, points_3d_norm, graph_obs, img_height, img_width
-    )
-
-    # Convert 4x4 absolute poses to 6-DOF (denorm) — use directly as GNN input
-    abs_poses_6dof = []
-    for pose in vo_poses:
-        if isinstance(pose, torch.Tensor):
-            pose = pose.cpu().numpy()
-        R = pose[:3, :3]
-        t = pose[:3, 3]
-        euler = rotation_to_euler(R, seq="zyx")
-        abs_poses_6dof.append(np.concatenate([euler, t]))
-    abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
-
-    # Use denormalized absolute poses directly as GNN input
-    camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
-    data["camera"].x = camera_feats_tensor
-
-    # Explicit normalized c2c edges (matches training)
-    cam_x = data["camera"].x
-    c2c_index, c2c_attr = compute_normalized_c2c_edges(cam_x, args.window_size)
-    data["camera", "temporal", "camera"].edge_index = c2c_index
-    data["camera", "temporal", "camera"].edge_attr = c2c_attr
-    data = data.to(device)
-
-    gnn_model.eval()
-    with torch.no_grad():
-        pred_rel_poses, point_refined = gnn_model(data, output_mode="relative")
-
-    # Denormalize GNN output and compose optimized absolute trajectory
-    pred_rel_poses_denorm = pred_rel_poses.clone()
-    pred_rel_poses_denorm[:, :3] = pred_rel_poses_denorm[:, :3] * torch.tensor(
-        KITTI_STD_ANGLES, device=device
-    ) + torch.tensor(KITTI_MEAN_ANGLES, device=device)
-    pred_rel_poses_denorm[:, 3:] = pred_rel_poses_denorm[:, 3:] * torch.tensor(
-        KITTI_STD_T, device=device
-    ) + torch.tensor(KITTI_MEAN_T, device=device)
-
-    first_pose_tensor = torch.tensor(vo_poses[0], dtype=torch.float32, device=device)
-    opt_abs_T = relative_poses_to_absolute_torch(
-        pred_rel_poses_denorm, first_pose_tensor, device
-    )
-    opt_points_np = point_refined.cpu().numpy()
-
-    opt_abs_np = opt_abs_T.cpu().numpy()
-
-    opt_poses = []
-    for i in range(args.window_size):
-        opt_poses.append(opt_abs_np[i])
-
-    gt_window_poses = test_sample["abs_poses"]  # Use absolute poses from dataset
-
-    plot_trajectories(
-        gt_window_poses,
-        vo_poses,
-        opt_poses,
-        os.path.join(args.save_dir, "trajectory_comparison.png"),
-    )
-
-    output_poses_path = os.path.join(args.save_dir, f"poses_test.txt")
-    with open(output_poses_path, "w") as f:
-        for pose in opt_poses:
-            row = pose.flatten()[:12]
-            f.write(" ".join([str(v) for v in row]) + "\n")
-    print(f"Poses saved to: {output_poses_path}")
-
-    print("\nGenerating full sequence trajectory...")
-
-    full_sequence_vo_poses, full_sequence_opt_poses = predict_full_sequence(
-        vo_model, gnn_model, full_dataset, train_args, device
-    )
-
-    print(f"Full sequence: {len(full_sequence_opt_poses)} poses predicted")
-
-    seq_vo_path = os.path.join(args.save_dir, f"poses_{args.sequence}_vo.txt")
-    seq_opt_path = os.path.join(args.save_dir, f"poses_{args.sequence}_opt.txt")
-
-    with open(seq_vo_path, "w") as f:
-        for pose in full_sequence_vo_poses:
-            row = pose.flatten()[:12]
-            f.write(" ".join([str(v) for v in row]) + "\n")
-
-    with open(seq_opt_path, "w") as f:
-        for pose in full_sequence_opt_poses:
-            row = pose.flatten()[:12]
-            f.write(" ".join([str(v) for v in row]) + "\n")
-
-    print(f"VO poses saved to: {seq_vo_path}")
-    print(f"Optimized poses saved to: {seq_opt_path}")
-
-    # Convert gt_poses from 3x4 to 4x4 for plotting
-    gt_poses_4x4 = []
-    for pose_3x4 in gt_poses[: len(full_sequence_opt_poses)]:
-        pose_4x4 = np.eye(4)
-        pose_4x4[:3, :4] = pose_3x4
-        gt_poses_4x4.append(pose_4x4)
-
-    plot_trajectories(
-        gt_poses_4x4,
-        full_sequence_vo_poses,
-        full_sequence_opt_poses,
-        os.path.join(args.save_dir, "trajectory_comparison.png"),
-    )
+    print("\nDone.")
 
 
 if __name__ == "__main__":
