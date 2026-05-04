@@ -1127,13 +1127,13 @@ def main():
     parser.add_argument(
         "--weighted_loss",
         type=float,
-        default=3.0,
+        default=1.0,
         help="Weight for angle part of pose supervision loss",
     )
     parser.add_argument(
         "--reproj_weight",
         type=float,
-        default=0.01,
+        default=0.1,
         help="Weight for reprojection loss term",
     )
     parser.add_argument(
