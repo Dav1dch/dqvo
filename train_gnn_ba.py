@@ -977,7 +977,7 @@ def build_vo_cache(vo_model, dataset, args, device, cache_path):
     std_t_np = KITTI_STD_T.copy()
 
     cache = {}
-    batch_size = 16
+    batch_size = 64
     total = len(dataset)
     print(f"\nBuilding VO cache ({total} windows) → {cache_path}")
     print("  Step 1: Running VO model on all windows...")
@@ -1061,7 +1061,7 @@ def build_vo_cache(vo_model, dataset, args, device, cache_path):
 
         # Triangulate from VO absolute poses
         points_3d, graph_obs, valid_tracks = triangulate_all_points(
-            tracks, abs_poses_4x4, K
+            tracks, abs_poses_4x4, K, device=device
         )
 
         if len(points_3d) < 10:
@@ -1081,7 +1081,7 @@ def build_vo_cache(vo_model, dataset, args, device, cache_path):
         T_inv = np.linalg.inv(gt_abs[0])
         gt_abs_rel = [T_inv @ p for p in gt_abs]
         gt_points_3d = triangulate_tracks_no_filter(
-            tracks, valid_tracks, gt_abs_rel, K, device="cpu"
+            tracks, valid_tracks, gt_abs_rel, K, device=device
         )
         if isinstance(gt_points_3d, torch.Tensor):
             gt_points_3d = gt_points_3d.cpu().numpy()
