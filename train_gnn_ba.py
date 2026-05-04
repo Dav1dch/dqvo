@@ -193,9 +193,15 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     img_height, img_width = all_img_dims[sample_idx]
 
                     camera_feats = c["vo_camera_feats"]
-                    points_3d = c["points_3d"].to(device)
+                    points_3d = c["points_3d"]
+                    if not torch.is_tensor(points_3d):
+                        points_3d = torch.tensor(points_3d, dtype=torch.float32)
+                    points_3d = points_3d.to(device)
                     graph_obs = c["graph_obs"]
-                    gt_points_3d = c["gt_points_3d"].to(device)
+                    gt_points_3d = c["gt_points_3d"]
+                    if not torch.is_tensor(gt_points_3d):
+                        gt_points_3d = torch.tensor(gt_points_3d, dtype=torch.float32)
+                    gt_points_3d = gt_points_3d.to(device)
                     abs_poses_4x4 = c["vo_abs_poses_4x4"]
 
                     if len(points_3d) < 10:
@@ -639,6 +645,8 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                 if not torch.is_tensor(points_3d):
                     points_3d = torch.tensor(points_3d, dtype=torch.float32)
                 points_3d = points_3d.to(device)
+                if points_3d.shape[0] < 10:
+                    continue
                 pt_mean = points_3d.mean(dim=0)
                 pt_std = points_3d.std(dim=0).clamp_min(1e-6)
                 points_3d_norm = (points_3d - pt_mean) / pt_std
@@ -667,6 +675,8 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                 ], dim=0)
                 if vo_rel is not None:
                     data["camera", "temporal", "camera"].edge_index = c2c_index
+                    if not torch.is_tensor(vo_rel):
+                        vo_rel = torch.tensor(vo_rel, dtype=torch.float32)
                     data["camera", "temporal", "camera"].edge_attr = vo_rel.clone().detach()
                 data = data.to(device)
 
@@ -1014,92 +1024,114 @@ def build_vo_cache(vo_model, dataset, args, device, cache_path):
         for j, idx in enumerate(batch_indices):
             vo_outputs[idx] = vo_output_np[j]
 
-    print(f"  Step 2: Triangulating 3D points...")
+    print(f"  Step 2: Pre-loading sample data...")
+    sample_data = []  # lightweight, picklable
+    for idx in tqdm(range(total), desc="Pre-loading"):
+        s = dataset[idx]
+        sample_data.append({
+            "tracks": s["tracks"],
+            "K": s["K"],
+            "gt_abs": s["abs_poses"],
+        })
 
-    for idx in tqdm(range(total), desc="Triangulation"):
-        sample = dataset[idx]
-        K = sample["K"]
-        tracks = sample["tracks"]
-        gt_abs = sample["abs_poses"]
+    print(f"  Step 3: Triangulating (parallel, {min(os.cpu_count() or 4, 16)} CPU cores)...")
 
-        vo_out = vo_outputs[idx]  # (window_size-1, 6) normalized
+    # Build args: all data is picklable (numpy arrays, lists, dicts, floats)
+    worker_args = []
+    for idx in range(total):
+        sd = sample_data[idx]
+        worker_args.append((
+            idx, sd["tracks"], sd["K"], sd["gt_abs"],
+            vo_outputs[idx],
+            mean_angles_np, std_angles_np, mean_t_np, std_t_np,
+        ))
 
-        # Denormalize and accumulate to absolute 4x4
-        rel_poses_denorm = []
-        for i in range(vo_out.shape[0]):
-            euler = vo_out[i, :3] * std_angles_np + mean_angles_np
-            t = vo_out[i, 3:] * std_t_np + mean_t_np
-            rel_poses_denorm.append(np.concatenate([euler, t]))
-
-        abs_poses_4x4 = [np.eye(4)]
-        for rel_pose in rel_poses_denorm:
-            R = euler_to_rotation(rel_pose[:3], seq="zyx")
-            T_rel = np.eye(4)
-            T_rel[:3, :3] = R
-            T_rel[:3, 3] = rel_pose[3:]
-            abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
-
-        # Camera features: absolute 6-DOF (denorm)
-        abs_poses_6dof = []
-        for pose in abs_poses_4x4:
-            R = pose[:3, :3]
-            t = pose[:3, 3]
-            euler = rotation_to_euler(R, seq="zyx")
-            abs_poses_6dof.append(np.concatenate([euler, t]))
-        camera_feats = np.array(abs_poses_6dof)
-
-        if len(tracks) < 10:
-            cache[idx] = {
-                "vo_camera_feats": camera_feats,
-                "vo_rel_poses": vo_out,
-                "points_3d": np.zeros((0, 3)),
-                "graph_obs": [],
-                "gt_points_3d": np.zeros((0, 3)),
-                "vo_abs_poses_4x4": abs_poses_4x4,
-            }
-            continue
-
-        # Triangulate from VO absolute poses
-        points_3d, graph_obs, valid_tracks = triangulate_all_points(
-            tracks, abs_poses_4x4, K, device=device
-        )
-
-        if len(points_3d) < 10:
-            if isinstance(points_3d, torch.Tensor):
-                points_3d = points_3d.cpu().numpy()
-            cache[idx] = {
-                "vo_camera_feats": camera_feats,
-                "vo_rel_poses": vo_out,
-                "points_3d": points_3d if isinstance(points_3d, np.ndarray) else np.array(points_3d),
-                "graph_obs": graph_obs,
-                "gt_points_3d": np.zeros((0, 3)),
-                "vo_abs_poses_4x4": abs_poses_4x4,
-            }
-            continue
-
-        # GT triangulation for point supervision
-        T_inv = np.linalg.inv(gt_abs[0])
-        gt_abs_rel = [T_inv @ p for p in gt_abs]
-        gt_points_3d = triangulate_tracks_no_filter(
-            tracks, valid_tracks, gt_abs_rel, K, device=device
-        )
-        if isinstance(gt_points_3d, torch.Tensor):
-            gt_points_3d = gt_points_3d.cpu().numpy()
-        if isinstance(points_3d, torch.Tensor):
-            points_3d = points_3d.cpu().numpy()
-
-        cache[idx] = {
-            "vo_camera_feats": camera_feats,
-            "vo_rel_poses": vo_out,
-            "points_3d": points_3d,
-            "graph_obs": graph_obs,
-            "gt_points_3d": gt_points_3d,
-            "vo_abs_poses_4x4": abs_poses_4x4,
-        }
+    import concurrent.futures
+    n_workers = min(os.cpu_count() or 4, 16)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_triangulate_one_worker, a): a[0] for a in worker_args}
+        for future in tqdm(
+            concurrent.futures.as_completed(futures), total=total, desc="Triangulation"
+        ):
+            idx, result = future.result()
+            cache[idx] = result
 
     torch.save(cache, cache_path)
     n_valid = sum(1 for c in cache.values() if len(c["points_3d"]) >= 10)
     print(f"  Cache saved: {len(cache)} windows ({n_valid} valid) → {cache_path}")
+
+
+def _triangulate_one_worker(args):
+    """Picklable worker for parallel cache building.  All inputs are simple
+    Python/numpy types so there are no pickle issues with ProcessPoolExecutor."""
+    idx, tracks, K, gt_abs, vo_out, mean_a, std_a, mean_t_, std_t_ = args
+
+    # Denormalize and accumulate
+    rel_poses_denorm = []
+    for i in range(vo_out.shape[0]):
+        euler = vo_out[i, :3] * std_a + mean_a
+        t = vo_out[i, 3:] * std_t_ + mean_t_
+        rel_poses_denorm.append(np.concatenate([euler, t]))
+
+    abs_poses_4x4 = [np.eye(4)]
+    for rel_pose in rel_poses_denorm:
+        R = euler_to_rotation(rel_pose[:3], seq="zyx")
+        T_rel = np.eye(4)
+        T_rel[:3, :3] = R
+        T_rel[:3, 3] = rel_pose[3:]
+        abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
+
+    camera_feats = np.array([
+        np.concatenate([rotation_to_euler(p[:3, :3], seq="zyx"), p[:3, 3]])
+        for p in abs_poses_4x4
+    ])
+
+    if len(tracks) < 10:
+        return idx, {
+            "vo_camera_feats": camera_feats,
+            "vo_rel_poses": vo_out,
+            "points_3d": np.zeros((0, 3)),
+            "graph_obs": [],
+            "gt_points_3d": np.zeros((0, 3)),
+            "vo_abs_poses_4x4": abs_poses_4x4,
+        }
+
+    points_3d, graph_obs, valid_tracks = triangulate_all_points(
+        tracks, abs_poses_4x4, K, device="cpu"
+    )
+
+    if len(points_3d) < 10:
+        if isinstance(points_3d, torch.Tensor):
+            points_3d = points_3d.cpu().numpy()
+        return idx, {
+            "vo_camera_feats": camera_feats,
+            "vo_rel_poses": vo_out,
+            "points_3d": points_3d if isinstance(points_3d, np.ndarray) else np.array(points_3d),
+            "graph_obs": graph_obs,
+            "gt_points_3d": np.zeros((0, 3)),
+            "vo_abs_poses_4x4": abs_poses_4x4,
+        }
+
+    T_inv = np.linalg.inv(gt_abs[0])
+    gt_abs_rel = [T_inv @ p for p in gt_abs]
+    gt_points_3d = triangulate_tracks_no_filter(
+        tracks, valid_tracks, gt_abs_rel, K, device="cpu"
+    )
+    if isinstance(gt_points_3d, torch.Tensor):
+        gt_points_3d = gt_points_3d.cpu().numpy()
+    if isinstance(points_3d, torch.Tensor):
+        points_3d = points_3d.cpu().numpy()
+
+    return idx, {
+        "vo_camera_feats": camera_feats,
+        "vo_rel_poses": vo_out,
+        "points_3d": points_3d,
+        "graph_obs": graph_obs,
+        "gt_points_3d": gt_points_3d,
+        "vo_abs_poses_4x4": abs_poses_4x4,
+    }
+
+
 
 
 def main():
