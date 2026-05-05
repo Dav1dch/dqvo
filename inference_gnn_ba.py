@@ -43,53 +43,6 @@ preprocess = transforms.Compose(
 
 
 
-def plot_trajectories(gt_poses, initial_poses, optimized_poses, save_path):
-    import matplotlib.pyplot as plt
-
-    gt_positions = np.array([p[:3, 3] for p in gt_poses])
-    initial_positions = np.array([p[:3, 3] for p in initial_poses])
-    opt_positions = np.array([p[:3, 3] for p in optimized_poses])
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-
-    ax.plot(
-        gt_positions[:, 0], gt_positions[:, 2], "b-", label="Ground Truth", linewidth=2
-    )
-    ax.plot(
-        initial_positions[:, 0],
-        initial_positions[:, 2],
-        "r--",
-        label="Initial VO",
-        linewidth=1.5,
-        alpha=0.7,
-    )
-    ax.plot(
-        opt_positions[:, 0],
-        opt_positions[:, 2],
-        "g-.",
-        label="GNN Optimized",
-        linewidth=1.5,
-        alpha=0.7,
-    )
-
-    ax.scatter(
-        gt_positions[0, 0], gt_positions[0, 2], c="b", s=100, marker="o", zorder=5
-    )
-    ax.scatter(
-        gt_positions[-1, 0], gt_positions[-1, 2], c="b", s=100, marker="x", zorder=5
-    )
-
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Z (m)")
-    ax.set_title("Camera Trajectory Comparison")
-    ax.legend()
-    ax.grid(True)
-    ax.axis("equal")
-
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Trajectory plot saved to: {save_path}")
-
 
 def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
     """
@@ -270,7 +223,9 @@ def main():
         default="gnn_ba_output/gnn_ba_best.pth",
         help="Path to trained GNN model",
     )
-    parser.add_argument("--sequence", type=str, default="03", help="Sequence number")
+    parser.add_argument("--sequence", type=str, default=None, help="Single sequence (overridden by --test_seqs)")
+    parser.add_argument("--test_seqs", type=str, default=None,
+                        help="Comma-separated test sequences, e.g. 01,03,05,07,10")
     parser.add_argument("--debug", action="store_true", help="Debug mode: use first 100 windows only")
     parser.add_argument("--window_size", type=int, default=3, help="Window size")
     parser.add_argument(
@@ -344,71 +299,99 @@ def main():
     gnn_model.eval()
     print("GNN model loaded successfully")
 
-    # Load dataset
-    print(f"\nLoading KITTI dataset for sequence {args.sequence}...")
-    dataset = KITTIFeatureDataset(
-        data_path=args.data_path,
-        gt_path=args.gt_path,
-        sequence=args.sequence,
-        window_size=args.window_size,
-        overlap=args.overlap,
-        max_points=200,
-    )
-    if args.debug:
-        print(f"Debug mode: limiting dataset to first 100 windows")
-        dataset = torch.utils.data.Subset(dataset, list(range(min(100, len(dataset)))))
-    print(f"Dataset size: {len(dataset)} windows")
+    # Determine test sequences
+    if args.test_seqs is not None:
+        test_seq_list = [s.strip() for s in args.test_seqs.split(",")]
+    elif args.sequence is not None:
+        test_seq_list = [args.sequence]
+    else:
+        test_seq_list = ["03"]
 
-    # Run inference
-    print("\nRunning inference...")
-    vo_poses, opt_poses = predict_sequence_simple(
-        vo_model, gnn_model, dataset, args, device
-    )
+    print(f"\nEvaluating on sequences: {test_seq_list}")
 
-    # Save poses
-    seq_vo_path = os.path.join(args.save_dir, f"poses_{args.sequence}_vo.txt")
-    seq_opt_path = os.path.join(args.save_dir, f"poses_{args.sequence}_opt.txt")
+    all_ate = {}
+    for seq in test_seq_list:
+        print(f"\n--- Sequence {seq} ---")
 
-    with open(seq_vo_path, "w") as f:
-        for pose in vo_poses:
-            row = pose.flatten()[:12]
-            f.write(" ".join([str(v) for v in row]) + "\n")
-
-    with open(seq_opt_path, "w") as f:
-        for pose in opt_poses:
-            row = pose.flatten()[:12]
-            f.write(" ".join([str(v) for v in row]) + "\n")
-
-    print(f"\nVO poses saved to: {seq_vo_path}")
-    print(f"Optimized poses saved to: {seq_opt_path}")
-
-    # Plot trajectory comparison
-    gt_poses = dataset.dataset.gt_poses if isinstance(dataset, torch.utils.data.Subset) else dataset.gt_poses
-    gt_poses_4x4 = []
-    for pose_3x4 in gt_poses[: len(opt_poses)]:
-        pose_4x4 = np.eye(4)
-        pose_4x4[:3, :4] = pose_3x4
-        gt_poses_4x4.append(pose_4x4)
-
-    plot_trajectories(
-        gt_poses_4x4,
-        vo_poses,
-        opt_poses,
-        os.path.join(args.save_dir, "trajectory_comparison.png"),
-    )
-
-    print(f"\nTrajectory plot saved to: {args.save_dir}/trajectory_comparison.png")
-
-    # Print comparison
-    print("\n=== Trajectory Comparison (first 5 frames) ===")
-    print("Frame | VO t | Optimized t | Diff norm")
-    for i in range(min(5, len(vo_poses), len(opt_poses))):
-        vo_t = vo_poses[i][:3, 3]
-        opt_t = opt_poses[i][:3, 3]
-        diff = np.linalg.norm(opt_t - vo_t)
-        print(
-            f"  {i}   | ({vo_t[0]:.3f}, {vo_t[1]:.3f}, {vo_t[2]:.3f}) | ({opt_t[0]:.3f}, {opt_t[1]:.3f}, {opt_t[2]:.3f}) | {diff:.3f}m"
+        # Load dataset
+        dataset = KITTIFeatureDataset(
+            data_path=args.data_path,
+            gt_path=args.gt_path,
+            sequence=seq,
+            window_size=args.window_size,
+            overlap=args.overlap,
+            max_points=200,
         )
+        if args.debug:
+            print(f"Debug mode: limiting dataset to first 100 windows")
+            dataset = torch.utils.data.Subset(dataset, list(range(min(100, len(dataset)))))
+        print(f"Dataset size: {len(dataset)} windows")
+
+        # Run inference
+        print("Running inference...")
+        vo_poses, opt_poses = predict_sequence_simple(
+            vo_model, gnn_model, dataset, args, device
+        )
+
+        # Compute ATE
+        gt_raw = dataset.dataset.gt_poses if isinstance(dataset, torch.utils.data.Subset) else dataset.gt_poses
+        gt_pos = np.array([p[:3, 3] for p in gt_raw])
+        vo_pos = np.array([p[:3, 3] for p in vo_poses])
+        opt_pos = np.array([p[:3, 3] for p in opt_poses])
+        n = min(len(gt_pos), len(vo_pos), len(opt_pos))
+        ate = np.sqrt(np.mean(np.sum((gt_pos[:n] - opt_pos[:n]) ** 2, axis=1)))
+        ate_vo = np.sqrt(np.mean(np.sum((gt_pos[:n] - vo_pos[:n]) ** 2, axis=1)))
+        all_ate[seq] = (ate_vo, ate)
+
+        # Save poses
+        vo_path = os.path.join(args.save_dir, f"poses_{seq}_vo.txt")
+        opt_path = os.path.join(args.save_dir, f"poses_{seq}_opt.txt")
+        with open(vo_path, "w") as f:
+            for p in vo_poses:
+                f.write(" ".join(f"{v:.6f}" for v in np.concatenate([p[:3, :3].flatten(), p[:3, 3]])) + "\n")
+        with open(opt_path, "w") as f:
+            for p in opt_poses:
+                f.write(" ".join(f"{v:.6f}" for v in np.concatenate([p[:3, :3].flatten(), p[:3, 3]])) + "\n")
+
+        # Plot trajectory
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            gt_poses_4x4 = []
+            for pose_3x4 in gt_raw[: n]:
+                pose_4x4 = np.eye(4)
+                pose_4x4[:3, :4] = pose_3x4
+                gt_poses_4x4.append(pose_4x4)
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.plot(gt_pos[:, 0], gt_pos[:, 2], "b-", label="GT", lw=1.5)
+            ax.plot(vo_pos[:, 0], vo_pos[:, 2], "r--", label=f"VO (ATE={ate_vo:.2f}m)", lw=1, alpha=0.5)
+            ax.plot(opt_pos[:, 0], opt_pos[:, 2], "g-", label=f"GNN (ATE={ate:.2f}m)", lw=1.5)
+            ax.set_title(f"Seq {seq} — VO={ate_vo:.2f}m  GNN={ate:.2f}m")
+            ax.legend(); ax.grid(True); ax.axis("equal")
+            plt.savefig(os.path.join(args.save_dir, f"traj_{seq}.png"), dpi=150, bbox_inches="tight")
+            plt.close()
+        except Exception:
+            pass
+
+        print(f"  VO ATE: {ate_vo:.4f}m  |  GNN ATE: {ate:.4f}m")
+
+    # Summary table
+    print("\n" + "=" * 55)
+    print("ATE SUMMARY")
+    print("=" * 55)
+    print(f"  {'Seq':>5}  {'VO ATE':>8}  {'GNN ATE':>8}  {'Δ':>8}")
+    print("  " + "-" * 40)
+    ate_vo_list, ate_gnn_list = [], []
+    for seq, (vo_a, gnn_a) in all_ate.items():
+        delta = vo_a - gnn_a
+        print(f"  {seq:>5}  {vo_a:>8.4f}  {gnn_a:>8.4f}  {delta:>+8.4f}")
+        ate_vo_list.append(vo_a)
+        ate_gnn_list.append(gnn_a)
+    print("  " + "-" * 40)
+    print(f"  Mean:  {np.mean(ate_vo_list):>8.4f}  {np.mean(ate_gnn_list):>8.4f}  {np.mean(ate_vo_list)-np.mean(ate_gnn_list):>+8.4f}")
+    print(f"  Median:{np.median(ate_vo_list):>8.4f}  {np.median(ate_gnn_list):>8.4f}  {np.median(ate_vo_list)-np.median(ate_gnn_list):>+8.4f}")
+
 
 
 if __name__ == "__main__":
