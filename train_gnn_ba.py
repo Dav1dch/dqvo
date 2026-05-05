@@ -947,9 +947,6 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
             num_track_count_low += 1
             opt_relative_poses_list.append(raw_vo_outputs[idx])
 
-        if (idx + 1) % 100 == 0:
-            print(f"Processed {idx + 1}/{len(dataset)} windows")
-
     # Print debug statistics
     print(f"\nGNN Optimization Debug Stats:")
     print(
@@ -1159,13 +1156,13 @@ def main():
     parser.add_argument(
         "--weighted_loss",
         type=float,
-        default=1.0,
+        default=3.0,
         help="Weight for angle part of pose supervision loss",
     )
     parser.add_argument(
         "--reproj_weight",
         type=float,
-        default=0.1,
+        default=0.01,
         help="Weight for reprojection loss term",
     )
     parser.add_argument(
@@ -1516,7 +1513,7 @@ def main():
                 ax.plot(opt_pos[:, 0], opt_pos[:, 2], "g-", label=f"GNN (ATE={ate:.2f}m)", lw=1.5)
                 ax.set_title(f"Seq {seq} — VO={ate_vo:.2f}m  GNN={ate:.2f}m")
                 ax.legend(); ax.grid(True); ax.axis("equal")
-                plt.savefig(os.path.join(args.save_dir, f"traj_{seq}.pdf"), dpi=150, bbox_inches="tight")
+                plt.savefig(os.path.join(args.save_dir, f"traj_{seq}.png"), dpi=150, bbox_inches="tight")
                 plt.close()
             except Exception:
                 pass
