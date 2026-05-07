@@ -18,6 +18,7 @@ python inference_gnn_ba.py         # VO + GNN inference
 python train_gnn_ba_noisy.py       # Noisy-GT GNN training (no VO model)
 python inference_gnn_ba_noisy.py   # Noisy-GT GNN inference
 python gnn_ba_test.py              # Single-window debug test
+python precompute_vo_cache.py      # Standalone cache builder (uses ProcessPoolExecutor)
 python train.py                    # Legacy VO training
 python predict_poses.py            # Legacy VO inference
 ```
@@ -26,11 +27,12 @@ python predict_poses.py            # Legacy VO inference
 
 | Script | Purpose | Deps |
 |--------|---------|------|
-| `train_gnn_ba.py` | VO + GNN training, multi-seq, cache | VO ckpt, KITTI |
+| `train_gnn_ba.py` | VO + GNN training, multi-seq, cache, 2-stage | VO ckpt, KITTI |
 | `train_gnn_ba_noisy.py` | Noisy-GT GNN training (no VO) | KITTI only |
-| `inference_gnn_ba.py` | VO + GNN full-sequence eval | VO ckpt, GNN ckpt |
+| `inference_gnn_ba.py` | VO + GNN full-sequence eval, multi-seq, ATE | VO ckpt, GNN ckpt |
 | `inference_gnn_ba_noisy.py` | Noisy-GT GNN full-sequence eval | GNN ckpt |
 | `gnn_ba_test.py` | Single-window debug (`image_0`, ORB matching) | KITTI only |
+| `precompute_vo_cache.py` | Build VO cache standalone (same format as `--build_cache`) | VO ckpt |
 | `timesformer/models/gnn_ba.py` | `GNNBAOptimizer` — shared GNN model | |
 | `datasets/kitti_gnn.py` | `KITTIFeatureDataset` — shared dataloader | |
 | `utils/gnn_ba.py` | triangulation, graph building, losses, post-processing | |
@@ -108,18 +110,31 @@ Do not change these without retraining the VO model. The DQ GNN does NOT use the
 - **Output heads**: `camera_out_proj` hidden→8, `c2c_pose_out_proj` hidden→8 (both `bias=True` with identity DQ bias `[1,0,0,0,0,0,0,0]`)
 - **Weight init**: Xavier `gain=0.001` for DQ output heads (must be small—DQ output is multiplicative, not additive). Point output uses `gain=1.0`.
 - **Output normalization**: `dq_normalize_torch()` projects raw output to valid DQ manifold (unit real part, orthogonal dual)
-- **Message passing**: 6 layers in order: c2c_edge → camera←point → point←camera → c2c_edge
+- **Message passing**: configurable `num_layers` (default 3 VO / 6 noisy). Layer order: c2c_edge → camera←point → point←camera → c2c_edge
 - **VO model is frozen** — `model.eval()` with `torch.no_grad()`. Only GNN parameters get gradients.
 
 ## Training Workflows
 
+### Stage 1 / Stage 2 training (VO mode)
+
+`train_gnn_ba.py` supports two-stage training via `--stage1_epochs N`:
+- **Stage 1** (epochs 1–N): DQ output heads (`c2c_pose_out_proj`, `camera_out_proj`) are **frozen** (no gradients). Only point and edge message-passing layers train. `pose_weight` is set to 0.
+- **Stage 2** (epochs N+1 to end): all parameters unfrozen, `pose_weight` restored. Optimizer and scheduler are re-created.
+
+Useful for warming up point triangulation before applying pose supervision. Set `--stage1_epochs 0` (default) to skip.
+
 ### VO mode — multi-sequence with cache (fast)
 ```bash
-# 1. Build cache (once, ~minutes)
+# Build cache (can use either approach):
+# A) Inline flag in train_gnn_ba.py
 python train_gnn_ba.py --checkpoint checkpoints/Exp51/checkpoint_best.pth \
     --train_seqs 00,02,08,09 --build_cache vo_cache.pt
 
-# 2. Train fast (GPU-only per epoch)
+# B) Standalone script (same output format)
+python precompute_vo_cache.py --checkpoint checkpoints/Exp51/checkpoint_best.pth \
+    --sequence 03
+
+# Train fast (GPU-only per epoch)
 python train_gnn_ba.py --checkpoint checkpoints/Exp51/checkpoint_best.pth \
     --train_seqs 00,02,08,09 --test_seqs 01,03,04,05,06,07,10 \
     --cache vo_cache.pt --num_epochs 20
@@ -147,7 +162,7 @@ The noisy script defaults to `num_workers=0`. The VO cache builder uses `Process
 ## Key Defaults
 
 - `window_size=3`, `overlap=2`, `batch_size=16`
-- `hidden_dim=256` (VO) / `128` (noisy), `num_layers=6`, `lr=5e-5` (VO) / `1e-4` (noisy)
+- `hidden_dim=256` (VO) / `128` (noisy), `num_layers=3` (VO) / `6` (noisy), `lr=5e-5` (VO) / `1e-4` (noisy)
 - `reproj_weight=0.01`, `pose_weight=1.0`, `point_weight=0.1`
 - `weighted_loss=3.0` (k multiplier on rotation part of geodesic loss), `loss_clip=500`
 - VO model: `dim=384`, `depth=16`, `heads=6`, `image_size=(224,672)`, `patch_size=16`
@@ -160,9 +175,10 @@ The noisy script defaults to `num_workers=0`. The VO cache builder uses `Process
 - **Post-processing averages DQs on SE(3) manifold** — `_dq_average_np()` extracts R,t, averages in log-space, re-encodes. Simple 8-D vector averaging produces invalid DQs that cause trajectory oscillation.
 - **`calib.txt` reads P2 line** (color camera intrinsics). `image_2/` (color). `gnn_ba_test.py` uses `image_0/` (grayscale, different intrinsics — P0 line).
 - **Cache builder uses CPU** — `_triangulate_one_worker` runs in `ProcessPoolExecutor`, cannot use CUDA.
-- **`gnn_ba_output/` is not gitignored** — avoid committing output files.
+- **`gnn_ba_output/` is gitignored** — avoid committing output files.
 - **CUDA OOM**: reduce `batch_size`.
+- **No formal tests** — validate by running `inference_gnn_ba.py` and checking trajectory plots. No pytest/lint infrastructure exists.
 
 ## Git Ignore
 
-`data/`, `checkpoints/`, `*.pth`, `*.pdf`, `*.pt`, `Exp53/`, `__pycache__/`, `.idea/` are gitignored.
+`data/`, `checkpoints/`, `*.pth`, `*.pdf`, `*.pt`, `Exp53/`, `__pycache__/`, `.idea/`, `gnn_ba_output/` are gitignored.

@@ -142,7 +142,7 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
     mean_t_np = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
     std_t_np = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
 
-    with tqdm(train_loader, unit="batch", dynamic_ncols=True) as tepoch:
+    with tqdm(train_loader, unit="batch", total=len(train_loader), ncols=100) as tepoch:
         for batch_data in tepoch:
             tepoch.set_description(f"Epoch {epoch}")
 
@@ -750,7 +750,7 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     raw_vo_outputs = []
 
     print("Step 1: Collecting VO model outputs...")
-    for idx in tqdm(range(len(dataset)), desc="Collecting outputs"):
+    for idx in tqdm(range(len(dataset)), total=len(dataset), ncols=100, desc="Collecting outputs"):
         sample = dataset[idx]
 
         pil_images = []
@@ -807,7 +807,7 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     num_success = 0
     total_rel_norm = 0.0
 
-    for idx in tqdm(range(len(dataset)), desc="GNN optimization"):
+    for idx in tqdm(range(len(dataset)), total=len(dataset), ncols=100, desc="GNN optimization"):
         sample = dataset[idx]
 
         K = sample["K"]
@@ -938,7 +938,7 @@ def build_vo_cache(vo_model, dataset, args, device, cache_path):
     vo_outputs = {}  # idx -> numpy array (window_size-1, 6)
 
     indices = list(range(total))
-    for start in tqdm(range(0, total, batch_size), desc="VO forward"):
+    for start in tqdm(range(0, total, batch_size), total=(total + batch_size - 1) // batch_size, ncols=100, desc="VO forward"):
         end = min(start + batch_size, total)
         batch_indices = indices[start:end]
 
@@ -968,7 +968,7 @@ def build_vo_cache(vo_model, dataset, args, device, cache_path):
 
     print(f"  Step 2: Pre-loading sample data...")
     sample_data = []  # lightweight, picklable
-    for idx in tqdm(range(total), desc="Pre-loading"):
+    for idx in tqdm(range(total), total=total, ncols=100, desc="Pre-loading"):
         s = dataset[idx]
         sample_data.append({
             "tracks": s["tracks"],
@@ -993,7 +993,7 @@ def build_vo_cache(vo_model, dataset, args, device, cache_path):
     with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(_triangulate_one_worker, a): a[0] for a in worker_args}
         for future in tqdm(
-            concurrent.futures.as_completed(futures), total=total, desc="Triangulation"
+            concurrent.futures.as_completed(futures), total=total, ncols=100, desc="Triangulation"
         ):
             idx, result = future.result()
             cache[idx] = result
