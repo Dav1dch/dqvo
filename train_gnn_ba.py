@@ -193,6 +193,9 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     img_height, img_width = all_img_dims[sample_idx]
 
                     camera_feats = c["vo_camera_feats"]
+                    cam_mean = camera_feats.mean(axis=0)
+                    cam_std = camera_feats.std(axis=0).clip(min=1e-6)
+                    camera_feats = (camera_feats - cam_mean) / cam_std
                     points_3d = c["points_3d"]
                     if not torch.is_tensor(points_3d):
                         points_3d = torch.tensor(points_3d, dtype=torch.float32)
@@ -312,6 +315,9 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                         euler = rotation_to_euler(R, seq="zyx")
                         abs_poses_6dof.append(np.concatenate([euler, t]))
                     camera_feats = np.array(abs_poses_6dof)
+                    cam_mean = camera_feats.mean(axis=0)
+                    cam_std = camera_feats.std(axis=0).clip(min=1e-6)
+                    camera_feats = (camera_feats - cam_mean) / cam_std
 
                     if len(tracks) < 10:
                         continue
@@ -513,7 +519,7 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 reproj_loss = huber_loss(valid_errors, delta=5.0).mean()
                 point_weight = args.get("point_weight", 1.0)
                 # Mean-pose regularization (gated by pose_weight to avoid gradient leakage in stage 1)
-                mean_pose_reg = 0.01 * pred_rel_poses.mean(dim=0).norm() * pose_weight
+                mean_pose_reg = 0.1 * pred_rel_poses.mean(dim=0).norm() * pose_weight
                 loss = (
                     reproj_loss * reproj_weight
                     + pose_loss * pose_weight
@@ -663,10 +669,12 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                     t = pose[:3, 3]
                     euler = rotation_to_euler(R, seq="zyx")
                     abs_poses_6dof.append(np.concatenate([euler, t]))
-                abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
+                abs_poses_6dof = np.array(abs_poses_6dof)
 
-                # Use denormalized absolute poses directly as GNN input
-                camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
+                cam_mean = abs_poses_6dof.mean(axis=0)
+                cam_std = abs_poses_6dof.std(axis=0).clip(min=1e-6)
+                abs_poses_6dof_norm = (abs_poses_6dof - cam_mean) / cam_std
+                camera_feats_tensor = torch.tensor(abs_poses_6dof_norm, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
 
                 # c2c edges: use exact VO relative poses if available, else fall back
@@ -781,9 +789,9 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
 
     This function generates a complete trajectory by:
     1. Running the VO model on all overlapping windows to get initial relative poses
-    2. Post-processing to merge overlapping windows (averaging)
+    2. Post-processing to merge overlapping windows (averaging) for VO baseline
     3. Accumulating relative poses into absolute trajectory (VO baseline)
-    4. Running GNN optimization on each window to refine poses
+    4. Running GNN optimization on each window using per-window VO poses (matching training)
     5. Post-processing and accumulating GNN-optimized poses
 
     The GNN optimization is applied per-window then merged the same way as VO poses,
@@ -838,7 +846,7 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     vo_poses, vo_trajectory = recover_trajectory_and_poses(processed_poses, norm=True)
     print(f"Recovered {len(vo_poses)} absolute poses")
 
-    # ---- Step 4: GNN optimization on each window ----
+    # ---- Step 4: GNN optimization on each window (per-window VO, matching training) ----
     print("Step 4: Running GNN optimization...")
 
     opt_relative_poses_list = []
@@ -849,18 +857,15 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     num_success = 0
     total_rel_norm = 0.0
 
+    mean_angles_np = KITTI_MEAN_ANGLES.copy()
+    std_angles_np = KITTI_STD_ANGLES.copy()
+    mean_t_np = KITTI_MEAN_T.copy()
+    std_t_np = KITTI_STD_T.copy()
+
     for idx in tqdm(range(len(dataset)), desc="GNN optimization"):
         sample = dataset[idx]
 
-        pil_images = []
-        for img in sample["images"]:
-            if len(img.shape) == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-            pil_img = Image.fromarray(img)
-            pil_images.append(preprocess(pil_img))
-
         K = sample["K"]
-        # Use original K (no scaling) for triangulation
         tracks = sample["tracks"]
         # Reformat tracks to (rel_frame_idx, u, v) format
         rel_tracks = []
@@ -869,22 +874,35 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
                 rel_tracks.append([(obs[0], obs[1], obs[2]) for obs in track])
         tracks = rel_tracks
 
-        # Get absolute poses for this window from the global VO trajectory
-        window_start = idx * (window_size - overlap)
-        # Handle boundary cases
-        if window_start >= len(vo_poses):
-            window_abs_poses = [vo_poses[-1]] * window_size
-        elif window_start + window_size > len(vo_poses):
-            window_abs_poses = vo_poses[window_start:]
-            while len(window_abs_poses) < window_size:
-                window_abs_poses.append(vo_poses[-1])
-        else:
-            window_abs_poses = vo_poses[window_start : window_start + window_size]
-
         if len(tracks) >= 10:
-            # Triangulate 3D points using original K
+            # Build absolute poses from per-window VO (match training, NOT merged global VO)
+            vo_out = raw_vo_outputs[idx]  # (window_size-1, 6) normalized
+            rel_poses_denorm = []
+            for i in range(vo_out.shape[0]):
+                euler = vo_out[i, :3] * std_angles_np + mean_angles_np
+                t = vo_out[i, 3:] * std_t_np + mean_t_np
+                rel_poses_denorm.append(np.concatenate([euler, t]))
+
+            abs_poses_4x4 = [np.eye(4)]
+            for rel_pose in rel_poses_denorm:
+                R = euler_to_rotation(rel_pose[:3], seq="zyx")
+                T_rel = np.eye(4)
+                T_rel[:3, :3] = R
+                T_rel[:3, 3] = rel_pose[3:]
+                abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
+
+            # Convert to 6-DOF absolute poses for GNN camera features
+            abs_poses_6dof = []
+            for pose in abs_poses_4x4:
+                R = pose[:3, :3]
+                t = pose[:3, 3]
+                euler = rotation_to_euler(R, seq="zyx")
+                abs_poses_6dof.append(np.concatenate([euler, t]))
+            abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
+
+            # Triangulate 3D points using per-window VO poses
             points_3d, graph_obs, _ = triangulate_all_points(
-                tracks, window_abs_poses, K
+                tracks, abs_poses_4x4, K
             )
 
             if len(points_3d) >= 10:
@@ -901,20 +919,11 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
                     window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
 
-                # Use accumulated absolute poses as GNN input (like validate)
-                # Convert 4x4 absolute poses to 6-DOF (denorm) — use directly as GNN input
-                abs_poses_6dof = []
-                for pose in window_abs_poses:
-                    if isinstance(pose, torch.Tensor):
-                        pose = pose.cpu().numpy()
-                    R = pose[:3, :3]
-                    t = pose[:3, 3]
-                    euler = rotation_to_euler(R, seq="zyx")
-                    abs_poses_6dof.append(np.concatenate([euler, t]))
-                abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
-
-                # Use denormalized absolute poses directly as GNN input
-                camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
+                # Use per-window normalized absolute poses as GNN input
+                cam_mean = abs_poses_6dof.mean(axis=0)
+                cam_std = abs_poses_6dof.std(axis=0).clip(min=1e-6)
+                abs_poses_6dof_norm = (abs_poses_6dof - cam_mean) / cam_std
+                camera_feats_tensor = torch.tensor(abs_poses_6dof_norm, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
 
                 # Explicit c2c edges using raw VO output (already normalized)
@@ -1144,12 +1153,12 @@ def main():
                         help="Comma-separated training sequences, e.g. 00,02,08,09")
     parser.add_argument("--test_seqs", type=str, default=None,
                         help="Comma-separated test sequences for final evaluation")
-    parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
-    parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension")
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden dimension")
     parser.add_argument(
-        "--num_layers", type=int, default=6, help="Number of GNN layers"
+        "--num_layers", type=int, default=3, help="Number of GNN layers"
     )
-    parser.add_argument("--lr", type=float, default=0.0001, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.00005, help="Learning rate")
     parser.add_argument(
         "--weight_decay", type=float, default=1e-4, help="Weight decay for optimizer"
     )
@@ -1283,6 +1292,7 @@ def main():
         train_seq_list = [s.strip() for s in args.train_seqs.split(",")]
         print(f"\nLoading KITTI datasets for training sequences: {train_seq_list}...")
         seq_datasets = []
+        offset = 0
         for seq in train_seq_list:
             ds = KITTIFeatureDataset(
                 data_path=args.data_path, gt_path=args.gt_path,
@@ -1290,7 +1300,24 @@ def main():
                 overlap=args.overlap, max_points=200,
             )
             print(f"  Seq {seq}: {len(ds)} windows")
+
+            # Wrap so sample_idx reflects the ConcatDataset-level index,
+            # matching the keys used by build_vo_cache.
+            _offset = offset
+            class _IdxWrapper(torch.utils.data.Dataset):
+                def __init__(self, ds, off):
+                    self.ds = ds
+                    self.off = off
+                def __getitem__(self, idx):
+                    item = self.ds[idx]
+                    item["sample_idx"] = self.off + idx
+                    return item
+                def __len__(self):
+                    return len(self.ds)
+            ds = _IdxWrapper(ds, _offset)
+            offset += len(ds)
             seq_datasets.append(ds)
+
         full_dataset = torch.utils.data.ConcatDataset(seq_datasets)
         print(f"Combined training dataset: {len(full_dataset)} windows")
     else:
@@ -1493,14 +1520,18 @@ def main():
             all_ate[seq] = (ate_vo, ate)
 
             # Save poses
+            pred_dir = os.path.join(args.save_dir, "pred_pose")
+            os.makedirs(pred_dir, exist_ok=True)
             vo_path = os.path.join(args.save_dir, f"poses_{seq}_vo.txt")
-            opt_path = os.path.join(args.save_dir, f"poses_{seq}_opt.txt")
+            opt_path = os.path.join(pred_dir, f"{seq}.txt")
             with open(vo_path, "w") as f:
                 for p in vo_poses:
-                    f.write(" ".join(f"{v:.6f}" for v in np.concatenate([p[:3, :3].flatten(), p[:3, 3]])) + "\n")
+                    vals = p[:3, :4]
+                    f.write(" ".join(f"{vals[i, j]:.6f}" for i in range(3) for j in range(4)) + "\n")
             with open(opt_path, "w") as f:
                 for p in opt_poses:
-                    f.write(" ".join(f"{v:.6f}" for v in np.concatenate([p[:3, :3].flatten(), p[:3, 3]])) + "\n")
+                    vals = p[:3, :4]
+                    f.write(" ".join(f"{vals[i, j]:.6f}" for i in range(3) for j in range(4)) + "\n")
 
             # Plot
             try:

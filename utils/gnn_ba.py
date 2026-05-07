@@ -870,7 +870,7 @@ def recover_trajectory_and_poses(poses, norm=True):
 
     T = np.eye(4)  # Initialize T at the start
 
-    for i in range(len(poses) - 1):
+    for i in range(len(poses)):
         angles = poses[i, :3]
         t = poses[i, 3:]
 

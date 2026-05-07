@@ -26,6 +26,8 @@ from utils.gnn_ba import (
     triangulate_all_points,
     build_heterogeneous_graph,
     rotation_to_euler,
+    euler_to_rotation,
+    poses_to_camera_features,
     post_processing,
     recover_trajectory_and_poses,
 )
@@ -91,17 +93,13 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
     num_triangulation_failed = 0
     num_track_count_low = 0
 
+    mean_angles_np = KITTI_MEAN_ANGLES.copy()
+    std_angles_np = KITTI_STD_ANGLES.copy()
+    mean_t_np = KITTI_MEAN_T.copy()
+    std_t_np = KITTI_STD_T.copy()
+
     for idx in tqdm(range(num_windows), desc="GNN optimization"):
         sample = dataset[idx]
-
-        # Prepare images
-        pil_images = []
-        for img in sample["images"]:
-            if len(img.shape) == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-            pil_img = Image.fromarray(img)
-            pil_images.append(preprocess(pil_img))
-        imgs_batch = torch.stack(pil_images, dim=1).squeeze(0).unsqueeze(0).to(device)
 
         K = sample["K"]
         tracks = sample["tracks"]
@@ -112,31 +110,34 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
                 rel_tracks.append([(obs[0], obs[1], obs[2]) for obs in track])
         tracks = rel_tracks
 
-        # Get absolute poses for this window from global VO trajectory
-        window_start = idx * step_size
-        if window_start >= len(vo_poses):
-            window_abs_poses = [vo_poses[-1]] * window_size
-        elif window_start + window_size > len(vo_poses):
-            window_abs_poses = vo_poses[window_start:]
-            while len(window_abs_poses) < window_size:
-                window_abs_poses.append(vo_poses[-1])
-        else:
-            window_abs_poses = vo_poses[window_start : window_start + window_size]
-
-        # Convert absolute poses to 6-DOF (denorm), then normalize for GNN
-        abs_poses_6dof = []
-        for pose in window_abs_poses:
-            if isinstance(pose, torch.Tensor):
-                pose = pose.cpu().numpy()
-            R = pose[:3, :3]
-            t = pose[:3, 3]
-            euler = rotation_to_euler(R, seq="zyx")
-            abs_poses_6dof.append(np.concatenate([euler, t]))
-        abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
-
-        # Build graph and run GNN if enough tracks
         if len(tracks) >= 10:
-            points_3d, graph_obs, _ = triangulate_all_points(tracks, window_abs_poses, K)
+            # Build absolute poses from per-window VO (match training, NOT merged global VO)
+            vo_out = vo_relative_poses[idx]  # (window_size-1, 6) normalized
+            rel_poses_denorm = []
+            for i in range(vo_out.shape[0]):
+                euler = vo_out[i, :3] * std_angles_np + mean_angles_np
+                t = vo_out[i, 3:] * std_t_np + mean_t_np
+                rel_poses_denorm.append(np.concatenate([euler, t]))
+
+            abs_poses_4x4 = [np.eye(4)]
+            for rel_pose in rel_poses_denorm:
+                R = euler_to_rotation(rel_pose[:3], seq="zyx")
+                T_rel = np.eye(4)
+                T_rel[:3, :3] = R
+                T_rel[:3, 3] = rel_pose[3:]
+                abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
+
+            # Convert to 6-DOF for camera features
+            abs_poses_6dof = []
+            for pose in abs_poses_4x4:
+                R = pose[:3, :3]
+                t = pose[:3, 3]
+                euler = rotation_to_euler(R, seq="zyx")
+                abs_poses_6dof.append(np.concatenate([euler, t]))
+            abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
+
+            # Triangulate 3D points using per-window VO poses
+            points_3d, graph_obs, _ = triangulate_all_points(tracks, abs_poses_4x4, K)
             if len(points_3d) >= 10:
                 # Normalize points for GNN input
                 if not torch.is_tensor(points_3d):
@@ -149,8 +150,11 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
                 data = build_heterogeneous_graph(
                     window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
-                # Use denormalized absolute poses as GNN input
-                camera_feats_tensor = torch.tensor(abs_poses_6dof, dtype=torch.float32)
+                # Use per-window normalized absolute poses as GNN input (match training)
+                cam_mean = abs_poses_6dof.mean(axis=0)
+                cam_std = abs_poses_6dof.std(axis=0).clip(min=1e-6)
+                abs_poses_6dof_norm = (abs_poses_6dof - cam_mean) / cam_std
+                camera_feats_tensor = torch.tensor(abs_poses_6dof_norm, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
                 # c2c edges: use exact VO relative pose (already normalized)
                 c2c_index = torch.stack([
@@ -344,14 +348,18 @@ def main():
         all_ate[seq] = (ate_vo, ate)
 
         # Save poses
+        pred_dir = os.path.join(args.save_dir, "pred_pose")
+        os.makedirs(pred_dir, exist_ok=True)
         vo_path = os.path.join(args.save_dir, f"poses_{seq}_vo.txt")
-        opt_path = os.path.join(args.save_dir, f"poses_{seq}_opt.txt")
+        opt_path = os.path.join(pred_dir, f"{seq}.txt")
         with open(vo_path, "w") as f:
             for p in vo_poses:
-                f.write(" ".join(f"{v:.6f}" for v in np.concatenate([p[:3, :3].flatten(), p[:3, 3]])) + "\n")
+                vals = p[:3, :4]
+                f.write(" ".join(f"{vals[i, j]:.6f}" for i in range(3) for j in range(4)) + "\n")
         with open(opt_path, "w") as f:
             for p in opt_poses:
-                f.write(" ".join(f"{v:.6f}" for v in np.concatenate([p[:3, :3].flatten(), p[:3, 3]])) + "\n")
+                vals = p[:3, :4]
+                f.write(" ".join(f"{vals[i, j]:.6f}" for i in range(3) for j in range(4)) + "\n")
 
         # Plot trajectory
         try:
