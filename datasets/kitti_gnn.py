@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import torch
 
-from utils.gnn_ba import rotation_to_euler
+from utils.dq import matrix_to_dq_np
 
 
 def load_kitti_intrinsics(calib_path):
@@ -307,25 +307,20 @@ class KITTIFeatureDataset(torch.utils.data.Dataset):
             pose_4x4[:3, :4] = pose_3x4
             abs_poses_4x4.append(pose_4x4)
 
-        # Compute RELATIVE poses: T_rel_ij = inv(T_i) @ T_j
-        # Returns window_size-1 relative poses between consecutive frames
-        # Convert to 6-DOF representation: [euler_z, euler_y, euler_x, t_x, t_y, t_z]
-        relative_poses_6dof = []
+        # Compute RELATIVE poses as dual quaternions
+        relative_poses_dq = []
         for i in range(len(abs_poses_4x4) - 1):
             T_rel = np.linalg.inv(abs_poses_4x4[i]) @ abs_poses_4x4[i + 1]
-            R = T_rel[:3, :3]
-            t = T_rel[:3, 3]
-            euler = rotation_to_euler(R, seq='zyx')  # [z, y, x] in radians
-            pose_6dof = np.concatenate([euler, t])  # (6,)
-            relative_poses_6dof.append(pose_6dof)
+            dq = matrix_to_dq_np(T_rel)  # (8,) dual quaternion
+            relative_poses_dq.append(dq)
 
         return {
             'images': images,
             'keypoints': keypoints_list,
             'tracks': tracks,
             'observations': observations,
-            'global_poses': np.array(relative_poses_6dof),  # 6-DOF: (window_size-1, 6)
-            'abs_poses': abs_poses_4x4,                       # Absolute 4x4 poses for triangulation
+            'global_poses': np.array(relative_poses_dq),  # DQ: (window_size-1, 8)
+            'abs_poses': abs_poses_4x4,                    # Absolute 4x4 poses for triangulation
             'window_indices': window_indices,
             'K': self.K,
             'sample_idx': idx,

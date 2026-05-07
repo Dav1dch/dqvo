@@ -14,6 +14,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from utils.dq import dq_mult_torch, dq_normalize_torch, dq_identity_torch
+
 
 class PointToCameraLayer(nn.Module):
     """
@@ -167,10 +169,10 @@ class GNNBAOptimizer(nn.Module):
         self,
         hidden_dim=32,
         num_layers=6,
-        camera_feat_dim=6,
+        camera_feat_dim=8,
         point_feat_dim=3,
         p2c_edge_dim=2,
-        c2c_edge_dim=6,
+        c2c_edge_dim=8,
         dropout=0.1,
     ):
         super().__init__()
@@ -196,15 +198,20 @@ class GNNBAOptimizer(nn.Module):
             [CameraEdgeUpdateLayer(hidden_dim, dropout) for _ in range(num_layers)]
         )
 
-        # Compatibility heads (no bias — learnable bias creates systematic drift)
-        self.camera_out_proj = nn.Linear(hidden_dim, 6, bias=False)
+        # Output heads: DQ correction (hidden→8) for cameras and c2c edges.
+        # Bias initialized to identity DQ so default output ≈ identity.
+        # Weight init gain=0.001 ensures initial residual is very small (DQ mult, not additive).
+        self.camera_out_proj = nn.Linear(hidden_dim, 8, bias=True)
         self.point_out_proj = nn.Linear(hidden_dim, 3, bias=False)
-        self.c2c_pose_out_proj = nn.Linear(hidden_dim, 6, bias=False)
+        self.c2c_pose_out_proj = nn.Linear(hidden_dim, 8, bias=True)
 
-        # Small init keeps initial residual corrections stable.
-        nn.init.xavier_uniform_(self.camera_out_proj.weight, gain=0.01)
-        nn.init.xavier_uniform_(self.point_out_proj.weight, gain=1.0)
-        nn.init.xavier_uniform_(self.c2c_pose_out_proj.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.camera_out_proj.weight, gain=0.001)
+        nn.init.constant_(self.camera_out_proj.bias, 0.0)
+        self.camera_out_proj.bias.data[0] = 1.0  # identity DQ bias
+        nn.init.xavier_uniform_(self.point_out_proj.weight, gain=0.001)
+        nn.init.xavier_uniform_(self.c2c_pose_out_proj.weight, gain=0.001)
+        nn.init.constant_(self.c2c_pose_out_proj.bias, 0.0)
+        self.c2c_pose_out_proj.bias.data[0] = 1.0  # identity DQ bias
 
     def _resolve_p2c_edges(self, data):
         """
@@ -300,16 +307,12 @@ class GNNBAOptimizer(nn.Module):
 
         if edge_attr is None:
             cam_x = data["camera"].x
-            if cam_x.shape[-1] >= self.c2c_edge_dim and edge_index.shape[1] > 0:
-                diff = cam_x[edge_index[1], : self.c2c_edge_dim] - cam_x[
-                    edge_index[0], : self.c2c_edge_dim
-                ]
-                # Normalize so GNN output matches the normalized loss space
-                std_a = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
-                std_t = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
-                std_vec = np.concatenate([std_a, std_t])
-                std_tensor = torch.tensor(std_vec, dtype=diff.dtype, device=diff.device)
-                edge_attr = diff / std_tensor
+            if edge_index.shape[1] > 0:
+                edge_attr = dq_identity_torch(
+                    (edge_index.shape[1],),
+                    device=cam_x.device,
+                    dtype=cam_x.dtype,
+                )
             else:
                 edge_attr = torch.zeros(
                     edge_index.shape[1],
@@ -390,15 +393,17 @@ class GNNBAOptimizer(nn.Module):
         point_refined = pt_x + point_delta
 
         if output_mode == "absolute":
-            if cam_x.shape[-1] == 6:
-                camera_refined = cam_x + camera_delta
+            if cam_x.shape[-1] == 8:
+                camera_delta_dq = dq_normalize_torch(self.camera_out_proj(camera_hidden))
+                camera_refined = dq_mult_torch(camera_delta_dq, cam_x)
             else:
-                camera_refined = camera_delta
+                camera_refined = cam_x + camera_delta
             return camera_refined, point_refined
 
         if output_mode == "relative":
-            c2c_delta = self.c2c_pose_out_proj(c2c_edge_hidden)
-            camera_relative = c2c_edge_attr + c2c_delta  # residual: noisy input + correction
+            c2c_delta_raw = self.c2c_pose_out_proj(c2c_edge_hidden)
+            d_correction = dq_normalize_torch(c2c_delta_raw)
+            camera_relative = dq_mult_torch(d_correction, c2c_edge_attr)
             return camera_relative, point_refined
 
         raise ValueError(f"Unsupported output_mode: {output_mode}")

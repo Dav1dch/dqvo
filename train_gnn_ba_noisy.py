@@ -25,21 +25,31 @@ from tqdm import tqdm
 from datasets.kitti_gnn import KITTIFeatureDataset
 from timesformer.models.gnn_ba import GNNBAOptimizer
 from utils.gnn_ba import (
-    KITTI_MEAN_ANGLES,
-    KITTI_STD_ANGLES,
-    KITTI_MEAN_T,
-    KITTI_STD_T,
     triangulate_all_points,
     triangulate_tracks_no_filter,
     build_heterogeneous_graph,
-    euler_to_rotation_torch,
     project_points_torch,
+    get_obs_depths_batch,
     huber_loss,
     compute_reprojection_error,
     post_processing,
     recover_trajectory_and_poses,
-    rotation_to_euler,
+    pose_6dof_to_dq,
     euler_to_rotation,
+)
+from utils.dq import (
+    dq_mult_np,
+    dq_conj_np,
+    dq_conj_torch,
+    dq_mult_torch,
+    dq_normalize_torch,
+    dq_geodesic_loss,
+    dq_transform_point_torch,
+    relative_poses_to_absolute_dq_torch,
+    dq_to_matrix_torch,
+    matrix_to_dq_np,
+    dq_identity_np,
+    dq_identity_torch,
 )
 
 
@@ -53,63 +63,48 @@ def set_seed(seed: int, deterministic: bool = True):
         torch.backends.cudnn.benchmark = False
 
 
-def relative_poses_to_absolute_torch(relative_poses, first_abs_pose, device):
-    rel_R = euler_to_rotation_torch(relative_poses[:, :3], seq="zyx")
-    rel_T = (
-        torch.eye(4, dtype=torch.float32, device=device)
-        .unsqueeze(0)
-        .repeat(relative_poses.shape[0], 1, 1)
-    )
-    rel_T[:, :3, :3] = rel_R
-    rel_T[:, :3, 3] = relative_poses[:, 3:]
-    abs_list = [first_abs_pose]
-    for i in range(rel_T.shape[0]):
-        abs_list.append(abs_list[-1] @ rel_T[i])
-    return torch.stack(abs_list, dim=0)
+def relative_poses_to_absolute_torch(relative_dq, first_abs_dq, device):
+    return relative_poses_to_absolute_dq_torch(relative_dq, first_abs_dq, device)
 
 
-def compute_normalized_c2c_edges(camera_feats, window_size):
-    cam_src = torch.arange(0, window_size - 1)
-    cam_dst = cam_src + 1
-    c2c_index = torch.stack([cam_src, cam_dst], dim=0)
-    ang_diff = camera_feats[1:, :3] - camera_feats[:-1, :3]
-    t_diff = camera_feats[1:, 3:6] - camera_feats[:-1, 3:6]
-    c2c_attr = torch.cat(
-        [
-            ang_diff / torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32),
-            t_diff / torch.tensor(KITTI_STD_T, dtype=torch.float32),
-        ],
-        dim=-1,
-    )
-    return c2c_index, c2c_attr
+def add_noise_to_relative_poses(rel_poses_dq, trans_noise, rot_noise):
+    """Add noise to DQ relative poses by converting to 6-DOF, adding noise, converting back."""
+    noisy_dq = []
+    for dq in rel_poses_dq:
+        R, t = dq_to_rt_np_noisy(dq)
+        t += np.random.randn(3) * trans_noise
+        from scipy.spatial.transform import Rotation
+        rot_vec = np.random.randn(3) * rot_noise
+        R_noise = Rotation.from_rotvec(rot_vec).as_matrix()
+        R_new = R_noise @ R
+        T = np.eye(4)
+        T[:3, :3] = R_new
+        T[:3, 3] = t
+        noisy_dq.append(matrix_to_dq_np(T))
+    return np.array(noisy_dq)
 
 
-def add_noise_to_relative_poses(rel_poses_6dof, trans_noise, rot_noise):
-    noisy = rel_poses_6dof.copy()
-    noisy[:, :3] += np.random.randn(*noisy[:, :3].shape) * rot_noise
-    noisy[:, 3:] += np.random.randn(*noisy[:, 3:].shape) * trans_noise
-    return noisy
+def accumulate_relative_poses(relative_poses_dq):
+    """Accumulate relative DQ poses into absolute DQ poses."""
+    abs_dq = [dq_identity_np()]
+    for rel in relative_poses_dq:
+        abs_dq.append(dq_mult_np(abs_dq[-1], rel))
+    return np.array(abs_dq)
 
 
-def accumulate_relative_poses(relative_poses_6dof):
-    abs_poses = [np.eye(4)]
-    for rel in relative_poses_6dof:
-        R = euler_to_rotation(rel[:3], seq="zyx")
-        T_rel = np.eye(4)
-        T_rel[:3, :3] = R
-        T_rel[:3, 3] = rel[3:]
-        abs_poses.append(abs_poses[-1] @ T_rel)
-    return abs_poses
+def dq_to_rt_np_noisy(dq):
+    """Extract R and t from DQ (numpy)."""
+    from utils.dq import _quat_to_rotmat_torch as _q2r, dq_extract_translation_torch
+    import torch as _t
+    dq_t = _t.as_tensor(dq, dtype=_t.float32).unsqueeze(0)
+    R_t = _q2r(dq_t[..., :4]).squeeze(0)
+    t_t = dq_extract_translation_torch(dq_t).squeeze(0)
+    return R_t.numpy(), t_t.numpy()
 
 
 def absolute_4x4_to_6dof(abs_poses):
-    result = []
-    for pose in abs_poses:
-        R = pose[:3, :3]
-        t = pose[:3, 3]
-        euler = rotation_to_euler(R, seq="zyx")
-        result.append(np.concatenate([euler, t]))
-    return np.array(result)
+    """Convert absolute 4x4 poses to DQ representation."""
+    return np.array([matrix_to_dq_np(p) for p in abs_poses])
 
 
 # =============================================================================
@@ -149,9 +144,10 @@ class NoisyWrapperDataset(torch.utils.data.Dataset):
             if len(tracks) >= 2:
                 T_inv = np.linalg.inv(gt_abs[0])
                 gt_abs_rel = [T_inv @ p for p in gt_abs]
+                gt_abs_dq = [matrix_to_dq_np(p) for p in gt_abs_rel]
                 all_indices = list(range(len(tracks)))
                 gt_pts_all = triangulate_tracks_no_filter(
-                    tracks, all_indices, gt_abs_rel, K, device="cpu"
+                    tracks, all_indices, gt_abs_dq, K, device="cpu"
                 )
             else:
                 gt_pts_all = torch.zeros(0, 3)
@@ -184,42 +180,41 @@ class NoisyWrapperDataset(torch.utils.data.Dataset):
                 self._noisy[idx] = {
                     "n_pts": 0,
                     "points_3d_norm": torch.zeros(0, 3),
-                    "camera_feats": np.zeros((self.window_size, 6)),
+                    "camera_feats": np.zeros((self.window_size, 8)),
                     "graph_obs": [],
                     "pt_mean": torch.zeros(3),
                     "pt_std": torch.ones(3),
                     "img_width": img_w,
                     "img_height": img_h,
                     "n_cam": self.window_size,
-                    "gt_rel": gt_rel,
-                    "noisy_rel": np.zeros((self.window_size - 1, 6)),
+                    "gt_rel_dq": gt_rel,
+                    "noisy_rel_dq": np.zeros((self.window_size - 1, 8)),
                     "gt_points_3d": torch.zeros(0, 3),
                     "K": K,
                 }
                 continue
 
             # Add noise + triangulate
-            noisy_rel = add_noise_to_relative_poses(gt_rel, self.trans_noise, self.rot_noise)
-            noisy_abs_4x4 = accumulate_relative_poses(noisy_rel)
-            camera_feats = absolute_4x4_to_6dof(noisy_abs_4x4)
+            noisy_rel_dq = add_noise_to_relative_poses(gt_rel, self.trans_noise, self.rot_noise)
+            noisy_abs_dq = accumulate_relative_poses(noisy_rel_dq)
 
             points_3d, graph_obs, valid_tracks = triangulate_all_points(
-                tracks, noisy_abs_4x4, K
+                tracks, noisy_abs_dq, K
             )
 
             if len(points_3d) < 10:
                 self._noisy[idx] = {
                     "n_pts": 0,
                     "points_3d_norm": torch.zeros(0, 3),
-                    "camera_feats": np.zeros((self.window_size, 6)),
+                    "camera_feats": np.zeros((self.window_size, 8)),
                     "graph_obs": [],
                     "pt_mean": torch.zeros(3),
                     "pt_std": torch.ones(3),
                     "img_width": img_w,
                     "img_height": img_h,
                     "n_cam": self.window_size,
-                    "gt_rel": gt_rel,
-                    "noisy_rel": np.zeros((self.window_size - 1, 6)),
+                    "gt_rel_dq": gt_rel,
+                    "noisy_rel_dq": np.zeros((self.window_size - 1, 8)),
                     "gt_points_3d": torch.zeros(0, 3),
                     "K": K,
                 }
@@ -241,15 +236,15 @@ class NoisyWrapperDataset(torch.utils.data.Dataset):
             self._noisy[idx] = {
                 "n_pts": points_3d.shape[0],
                 "points_3d_norm": points_3d_norm,
-                "camera_feats": camera_feats,
+                "camera_feats": noisy_abs_dq,
                 "graph_obs": graph_obs,
                 "pt_mean": pt_mean,
                 "pt_std": pt_std,
                 "img_width": img_w,
                 "img_height": img_h,
                 "n_cam": self.window_size,
-                "gt_rel": gt_rel,
-                "noisy_rel": noisy_rel,
+                "gt_rel_dq": gt_rel,
+                "noisy_rel_dq": noisy_rel_dq,
                 "gt_points_3d": gt_points_3d,
                 "K": K,
             }
@@ -269,11 +264,11 @@ def noisy_collate_fn(batch):
             collated[key] = [sample[key] for sample in batch]
         elif key in ("points_3d_norm", "pt_mean", "pt_std", "gt_points_3d"):
             collated[key] = [sample[key] for sample in batch]
-        elif key in ("camera_feats", "noisy_rel"):
+        elif key in ("camera_feats", "noisy_rel_dq"):
             collated[key] = [torch.tensor(sample[key], dtype=torch.float32) for sample in batch]
         elif key == "graph_obs":
             collated[key] = [sample[key] for sample in batch]
-        elif key == "gt_rel":
+        elif key in ("gt_rel_dq", "gt_rel", "global_poses"):
             collated[key] = [sample[key] for sample in batch]
         else:
             collated[key] = [sample[key] for sample in batch]
@@ -295,15 +290,10 @@ def train_epoch(gnn_model, train_loader, optimizer, epoch, args, device):
     epoch_loss = 0
     num_batches = 0
 
-    mean_angles = torch.tensor(KITTI_MEAN_ANGLES, dtype=torch.float32, device=device)
-    std_angles = torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32, device=device)
-    mean_t = torch.tensor(KITTI_MEAN_T, dtype=torch.float32, device=device)
-    std_t = torch.tensor(KITTI_STD_T, dtype=torch.float32, device=device)
-    # CPU copies for graph building (before .to(device))
-    mean_angles_cpu = torch.tensor(KITTI_MEAN_ANGLES, dtype=torch.float32)
-    std_angles_cpu = torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32)
-    mean_t_cpu = torch.tensor(KITTI_MEAN_T, dtype=torch.float32)
-    std_t_cpu = torch.tensor(KITTI_STD_T, dtype=torch.float32)
+    mean_angles_cpu = torch.tensor([1.7061e-5, 9.5582e-4, -5.5258e-5], dtype=torch.float32)
+    std_angles_cpu = torch.tensor([2.8256e-3, 1.7771e-2, 3.2326e-3], dtype=torch.float32)
+    mean_t_cpu = torch.tensor([-8.6736e-5, -1.6038e-2, 9.0033e-1], dtype=torch.float32)
+    std_t_cpu = torch.tensor([2.5584e-2, 1.8545e-2, 3.0352e-1], dtype=torch.float32)
 
     window_size = args["window_size"]
     reproj_weight = args.get("reproj_weight", 0.01)
@@ -332,7 +322,7 @@ def train_epoch(gnn_model, train_loader, optimizer, epoch, args, device):
                 points_3d_norm = batch_data["points_3d_norm"][i]
                 camera_feats = batch_data["camera_feats"][i]
                 graph_obs = batch_data["graph_obs"][i]
-                noisy_rel = batch_data["noisy_rel"][i]
+                noisy_rel_dq = batch_data["noisy_rel_dq"][i]
 
                 if n_pts < 10:
                     graphs.append(None)
@@ -346,15 +336,12 @@ def train_epoch(gnn_model, train_loader, optimizer, epoch, args, device):
                 )
                 data["camera"].x = camera_feats
 
-                # c2c edges: use the EXACT noisy relative pose (normalized)
+                # c2c edges: use DQ noisy relative pose
                 c2c_index = torch.stack([
                     torch.arange(0, n_cam - 1), torch.arange(1, n_cam)
                 ], dim=0)
-                noisy_rel_norm = noisy_rel.clone()
-                noisy_rel_norm[:, :3] = (noisy_rel_norm[:, :3] - mean_angles_cpu) / std_angles_cpu
-                noisy_rel_norm[:, 3:] = (noisy_rel_norm[:, 3:] - mean_t_cpu) / std_t_cpu
                 data["camera", "temporal", "camera"].edge_index = c2c_index
-                data["camera", "temporal", "camera"].edge_attr = noisy_rel_norm
+                data["camera", "temporal", "camera"].edge_attr = noisy_rel_dq
                 data = data.to(device)
                 graphs.append(data)
             # ---- Batched GNN forward ----
@@ -387,13 +374,10 @@ def train_epoch(gnn_model, train_loader, optimizer, epoch, args, device):
                     edge_start : edge_start + n_edges_per_sample
                 ]
 
-                # Denormalize GNN relative-pose output
-                pred_rel_denorm = pred_rel_poses.clone()
-                pred_rel_denorm[:, :3] = pred_rel_denorm[:, :3] * std_angles + mean_angles
-                pred_rel_denorm[:, 3:] = pred_rel_denorm[:, 3:] * std_t + mean_t
-                first_pose = torch.eye(4, device=device)
-                pose_matrices = relative_poses_to_absolute_torch(
-                    pred_rel_denorm, first_pose, device
+                # Denormalize GNN DQ output and compose absolute DQ
+                first_pose_dq = dq_identity_torch((), device)
+                abs_dq = relative_poses_to_absolute_dq_torch(
+                    pred_rel_poses, first_pose_dq, device
                 )
 
                 # Denormalize GNN-refined points
@@ -408,34 +392,23 @@ def train_epoch(gnn_model, train_loader, optimizer, epoch, args, device):
                 u_obs = edge_attr[:, 0] * img_width
                 v_obs = edge_attr[:, 1] * img_height
 
-                projected = project_points_torch(points_3d_refined, pose_matrices, K, device)
+                projected = project_points_torch(points_3d_refined, abs_dq, K, device)
                 cam_indices = edge_index[0]
                 pt_indices = edge_index[1]
                 proj_x = projected[cam_indices, pt_indices, 0]
                 proj_y = projected[cam_indices, pt_indices, 1]
                 errors = torch.sqrt((proj_x - u_obs) ** 2 + (proj_y - v_obs) ** 2)
 
-                poses_w2c = torch.inverse(pose_matrices)
-                points_h = torch.cat(
-                    [points_3d_refined, torch.ones(n_pts, 1, device=device)], dim=1
-                )
-                points_cam = torch.matmul(poses_w2c[:, :3, :], points_h.T)
-                depths = points_cam[:, 2, :]
-                obs_depths = depths[cam_indices, pt_indices]
+                obs_depths = get_obs_depths_batch(abs_dq, points_3d_refined, cam_indices, pt_indices)
                 valid_errors = errors[obs_depths > 0.1]
 
-                # Pose supervision
-                gt_rel = batch_data["gt_rel"][i]
-                if isinstance(gt_rel, np.ndarray) and gt_rel.ndim == 3:
-                    gt_rel = gt_rel[0]
-                gt_rel_tensor = torch.as_tensor(gt_rel, dtype=torch.float32, device=device)
-                gt_rel_norm = gt_rel_tensor.clone()
-                gt_rel_norm[:, :3] = (gt_rel_norm[:, :3] - mean_angles) / std_angles
-                gt_rel_norm[:, 3:] = (gt_rel_norm[:, 3:] - mean_t) / std_t
+                # Pose supervision: geodesic SE(3) loss
+                gt_rel_dq = batch_data["gt_rel_dq"][i]
+                if isinstance(gt_rel_dq, np.ndarray) and gt_rel_dq.ndim == 3:
+                    gt_rel_dq = gt_rel_dq[0]
+                gt_rel_dq_tensor = torch.as_tensor(gt_rel_dq, dtype=torch.float32, device=device)
 
-                loss_angles = k * F.mse_loss(pred_rel_poses[:, :3], gt_rel_norm[:, :3])
-                loss_translation = F.mse_loss(pred_rel_poses[:, 3:], gt_rel_norm[:, 3:])
-                pose_loss = loss_angles + loss_translation
+                pose_loss = dq_geodesic_loss(pred_rel_poses, gt_rel_dq_tensor, k=k)
 
                 # Point supervision
                 if gt_points_3d.numel() > 0 and points_3d_refined.shape[0] == gt_points_3d.shape[0]:
@@ -512,15 +485,10 @@ def validate(gnn_model, val_loader, args, device):
 
     window_size = args["window_size"]
 
-    mean_angles_t = torch.tensor(KITTI_MEAN_ANGLES, dtype=torch.float32, device=device)
-    std_angles_t = torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32, device=device)
-    mean_t_t = torch.tensor(KITTI_MEAN_T, dtype=torch.float32, device=device)
-    std_t_t = torch.tensor(KITTI_STD_T, dtype=torch.float32, device=device)
-    # CPU copies for graph building
-    mean_angles_cpu = torch.tensor(KITTI_MEAN_ANGLES, dtype=torch.float32)
-    std_angles_cpu = torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32)
-    mean_t_cpu = torch.tensor(KITTI_MEAN_T, dtype=torch.float32)
-    std_t_cpu = torch.tensor(KITTI_STD_T, dtype=torch.float32)
+    mean_angles_cpu = torch.tensor([1.7061e-5, 9.5582e-4, -5.5258e-5], dtype=torch.float32)
+    std_angles_cpu = torch.tensor([2.8256e-3, 1.7771e-2, 3.2326e-3], dtype=torch.float32)
+    mean_t_cpu = torch.tensor([-8.6736e-5, -1.6038e-2, 9.0033e-1], dtype=torch.float32)
+    std_t_cpu = torch.tensor([2.5584e-2, 1.8545e-2, 3.0352e-1], dtype=torch.float32)
 
     with torch.no_grad():
         for batch_data in val_loader:
@@ -536,7 +504,7 @@ def validate(gnn_model, val_loader, args, device):
                 img_width = batch_data["img_width"][i]
                 graph_obs = batch_data["graph_obs"][i]
                 camera_feats = batch_data["camera_feats"][i]
-                noisy_rel = batch_data["noisy_rel"][i]
+                noisy_rel_dq = batch_data["noisy_rel_dq"][i]
                 points_3d_norm = batch_data["points_3d_norm"][i]
                 pt_mean = batch_data["pt_mean"][i].to(device)
                 pt_std = batch_data["pt_std"][i].to(device)
@@ -549,56 +517,41 @@ def validate(gnn_model, val_loader, args, device):
                     window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
                 data["camera"].x = camera_feats
-                # c2c edges: use EXACT noisy relative pose (normalized)
+                # c2c edges: use DQ noisy relative pose
                 c2c_index = torch.stack([
                     torch.arange(0, window_size - 1), torch.arange(1, window_size)
                 ], dim=0)
-                if not torch.is_tensor(noisy_rel):
-                    noisy_rel = torch.tensor(noisy_rel, dtype=torch.float32)
-                noisy_rel_norm = noisy_rel.clone()
-                noisy_rel_norm[:, :3] = (noisy_rel_norm[:, :3] - mean_angles_cpu) / std_angles_cpu
-                noisy_rel_norm[:, 3:] = (noisy_rel_norm[:, 3:] - mean_t_cpu) / std_t_cpu
+                if not torch.is_tensor(noisy_rel_dq):
+                    noisy_rel_dq = torch.tensor(noisy_rel_dq, dtype=torch.float32)
                 data["camera", "temporal", "camera"].edge_index = c2c_index
-                data["camera", "temporal", "camera"].edge_attr = noisy_rel_norm
+                data["camera", "temporal", "camera"].edge_attr = noisy_rel_dq
                 data = data.to(device)
 
                 pred_rel_poses, point_refined = gnn_model(data, output_mode="relative")
 
-                # Denormalize poses
-                pred_rel_denorm = pred_rel_poses.clone()
-                pred_rel_denorm[:, :3] = pred_rel_denorm[:, :3] * std_angles_t + mean_angles_t
-                pred_rel_denorm[:, 3:] = pred_rel_denorm[:, 3:] * std_t_t + mean_t_t
-
-                first_pose = torch.eye(4, device=device)
-                opt_abs_T = relative_poses_to_absolute_torch(pred_rel_denorm, first_pose, device)
-                opt_abs_np = opt_abs_T.cpu().numpy()
-                opt_poses = [opt_abs_np[i] for i in range(window_size)]
+                # Compose absolute DQ
+                first_pose_dq = dq_identity_torch((), device)
+                opt_abs_dq = relative_poses_to_absolute_dq_torch(pred_rel_poses, first_pose_dq, device)
+                opt_abs_np = opt_abs_dq.cpu().numpy()  # (M, 8) DQ
 
                 # Denormalize points
                 point_refined_denorm = point_refined * pt_std + pt_mean
                 opt_points_np = point_refined_denorm.cpu().numpy()
 
-                # Reconstruct noisy absolute poses from camera_feats (exact same as triangulation)
+                # Reconstruct noisy absolute DQ from camera_feats
                 if isinstance(camera_feats, torch.Tensor):
                     cf = camera_feats.cpu().numpy()
                 else:
                     cf = camera_feats
-                noisy_abs = []
-                for row in cf:
-                    R = euler_to_rotation(row[:3], seq="zyx")
-                    pose = np.eye(4)
-                    pose[:3, :3] = R
-                    pose[:3, 3] = row[3:]
-                    noisy_abs.append(pose)
 
                 # Initial points: denormalize the noisy triangulation
                 points_3d_np = (points_3d_norm * pt_std.cpu() + pt_mean.cpu()).cpu().numpy()
 
                 initial_error = compute_reprojection_error(
-                    noisy_abs, points_3d_np, graph_obs, K, img_height, img_width
+                    cf, points_3d_np, graph_obs, K, img_height, img_width
                 )
                 optimized_error = compute_reprojection_error(
-                    opt_poses, opt_points_np, graph_obs, K, img_height, img_width
+                    opt_abs_np, opt_points_np, graph_obs, K, img_height, img_width
                 )
 
                 total_error_initial += initial_error
@@ -639,16 +592,16 @@ def predict_full_sequence(gnn_model, dataset, args, device):
         img_height, img_width = sample["images"][0].shape[:2]
 
         if len(tracks) < 10:
-            opt_relative_poses_list.append(np.zeros((window_size - 1, 6)))
+            opt_relative_poses_list.append(np.zeros((window_size - 1, 8)))
             continue
 
-        noisy_rel = add_noise_to_relative_poses(gt_rel, trans_noise, rot_noise)
-        noisy_abs = accumulate_relative_poses(noisy_rel)
-        camera_feats = absolute_4x4_to_6dof(noisy_abs)
+        noisy_rel_dq = add_noise_to_relative_poses(gt_rel, trans_noise, rot_noise)
+        noisy_abs_dq = accumulate_relative_poses(noisy_rel_dq)
+        camera_feats = noisy_abs_dq
 
-        points_3d, graph_obs, _ = triangulate_all_points(tracks, noisy_abs, K)
+        points_3d, graph_obs, _ = triangulate_all_points(tracks, noisy_abs_dq, K)
         if len(points_3d) < 10:
-            opt_relative_poses_list.append(np.zeros((window_size - 1, 6)))
+            opt_relative_poses_list.append(np.zeros((window_size - 1, 8)))
             continue
 
         if not torch.is_tensor(points_3d):
@@ -661,20 +614,12 @@ def predict_full_sequence(gnn_model, dataset, args, device):
             window_size, points_3d_norm, graph_obs, img_height, img_width
         )
         data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
-        # c2c edges: use EXACT noisy relative pose (normalized)
+        # c2c edges: use DQ noisy relative pose
         c2c_index = torch.stack([
             torch.arange(0, window_size - 1), torch.arange(1, window_size)
         ], dim=0)
-        noisy_rel_t = torch.tensor(noisy_rel, dtype=torch.float32)
-        noisy_rel_norm = noisy_rel_t.clone()
-        std_a_t = torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32)
-        mean_a_t = torch.tensor(KITTI_MEAN_ANGLES, dtype=torch.float32)
-        std_t_t_p = torch.tensor(KITTI_STD_T, dtype=torch.float32)
-        mean_t_t_p = torch.tensor(KITTI_MEAN_T, dtype=torch.float32)
-        noisy_rel_norm[:, :3] = (noisy_rel_norm[:, :3] - mean_a_t) / std_a_t
-        noisy_rel_norm[:, 3:] = (noisy_rel_norm[:, 3:] - mean_t_t_p) / std_t_t_p
         data["camera", "temporal", "camera"].edge_index = c2c_index
-        data["camera", "temporal", "camera"].edge_attr = noisy_rel_norm
+        data["camera", "temporal", "camera"].edge_attr = torch.tensor(noisy_rel_dq, dtype=torch.float32)
         data = data.to(device)
 
         with torch.no_grad():
@@ -687,7 +632,7 @@ def predict_full_sequence(gnn_model, dataset, args, device):
 
     opt_relative_poses = np.array(opt_relative_poses_list)
     processed = post_processing(opt_relative_poses, window_size, overlap)
-    opt_poses, _ = recover_trajectory_and_poses(processed, norm=True)
+    opt_poses, _ = recover_trajectory_and_poses(processed, use_dq=True)
     return opt_poses
 
 

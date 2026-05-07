@@ -40,26 +40,36 @@ from build_model import build_model
 from datasets.kitti_gnn import KITTIFeatureDataset
 from timesformer.models.gnn_ba import GNNBAOptimizer
 from utils.gnn_ba import (
-    KITTI_MEAN_ANGLES,
-    KITTI_STD_ANGLES,
-    KITTI_MEAN_T,
-    KITTI_STD_T,
     triangulate_all_points,
     triangulate_tracks_no_filter,
     triangulate_from_graph_obs,
     build_heterogeneous_graph,
     poses_to_camera_features,
-    denormalize_poses,
-    euler_to_rotation_torch,
+    pose_6dof_to_dq,
     project_points_torch,
+    get_obs_depths_batch,
     huber_loss,
     compute_reprojection_error,
     post_processing,
     recover_trajectory_and_poses,
-    rotation_to_euler,
     euler_to_rotation,
-    pose_6dof_to_matrix_torch,
-    camera_features_to_poses,
+)
+from utils.dq import (
+    dq_mult_np,
+    dq_conj_np,
+    dq_inverse_np,
+    dq_conj_torch,
+    dq_inverse_torch,
+    dq_mult_torch,
+    dq_normalize_torch,
+    dq_geodesic_loss,
+    dq_transform_point_torch,
+    relative_poses_to_absolute_dq_torch,
+    dq_to_matrix_torch,
+    dq_to_matrix_np,
+    matrix_to_dq_np,
+    dq_identity_np,
+    dq_identity_torch,
 )
 
 
@@ -75,40 +85,23 @@ preprocess = transforms.Compose(
 )
 
 
-def relative_poses_to_absolute_torch(relative_poses, first_abs_pose, device):
-    """Compose relative 6-DoF poses into absolute 4x4 poses with a fixed anchor."""
-    rel_R = euler_to_rotation_torch(relative_poses[:, :3], seq="zyx")
-    rel_T = (
-        torch.eye(4, dtype=torch.float32, device=device)
-        .unsqueeze(0)
-        .repeat(relative_poses.shape[0], 1, 1)
-    )
-    rel_T[:, :3, :3] = rel_R
-    rel_T[:, :3, 3] = relative_poses[:, 3:]
-
-    abs_list = [first_abs_pose]
-    for i in range(rel_T.shape[0]):
-        abs_list.append(abs_list[-1] @ rel_T[i])
-
-    return torch.stack(abs_list, dim=0)
+def relative_poses_to_absolute_torch(relative_dq, first_abs_dq, device):
+    """Compose relative DQ poses into absolute DQ poses."""
+    return relative_poses_to_absolute_dq_torch(relative_dq, first_abs_dq, device)
 
 
 def compute_normalized_c2c_edges(camera_feats, window_size):
-    """Compute normalized camera-to-camera edge attributes from camera features."""
+    """
+    Compute c2c edge attributes from DQ camera features.
+    Uses relative DQ between consecutive cameras, not normalized.
+    """
     cam_src = torch.arange(0, window_size - 1)
     cam_dst = cam_src + 1
     c2c_index = torch.stack([cam_src, cam_dst], dim=0)
-
-    ang_diff = camera_feats[1:, :3] - camera_feats[:-1, :3]
-    t_diff = camera_feats[1:, 3:6] - camera_feats[:-1, 3:6]
-    c2c_attr = torch.cat(
-        [
-            ang_diff / torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32),
-            t_diff / torch.tensor(KITTI_STD_T, dtype=torch.float32),
-        ],
-        dim=-1,
-    )
-
+    c2c_attr = torch.zeros(window_size - 1, 8, dtype=torch.float32)
+    for i in range(window_size - 1):
+        rel_dq = dq_mult_torch(dq_inverse_torch(camera_feats[i:i+1]), camera_feats[i+1:i+2])
+        c2c_attr[i] = rel_dq[0]
     return c2c_index, c2c_attr
 
 
@@ -144,15 +137,10 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
     running_point_loss = 0
     num_loss_samples = 0
 
-    mean_angles_np = KITTI_MEAN_ANGLES.copy()
-    std_angles_np = KITTI_STD_ANGLES.copy()
-    mean_t_np = KITTI_MEAN_T.copy()
-    std_t_np = KITTI_STD_T.copy()
-
-    mean_angles = torch.tensor(KITTI_MEAN_ANGLES, dtype=torch.float32, device=device)
-    std_angles = torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32, device=device)
-    mean_t = torch.tensor(KITTI_MEAN_T, dtype=torch.float32, device=device)
-    std_t = torch.tensor(KITTI_STD_T, dtype=torch.float32, device=device)
+    mean_angles_np = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    std_angles_np = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    mean_t_np = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    std_t_np = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
 
     with tqdm(train_loader, unit="batch", dynamic_ncols=True) as tepoch:
         for batch_data in tepoch:
@@ -189,13 +177,10 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 # ---- Phase 2 (cached): build graphs from cache ----
                 valid_data = []
                 for sample_idx, c in cached_samples:
-                    gt_relative_poses = all_global_poses[sample_idx]
+                    gt_rel_dq_cached = all_global_poses[sample_idx]
                     img_height, img_width = all_img_dims[sample_idx]
 
-                    camera_feats = c["vo_camera_feats"]
-                    cam_mean = camera_feats.mean(axis=0)
-                    cam_std = camera_feats.std(axis=0).clip(min=1e-6)
-                    camera_feats = (camera_feats - cam_mean) / cam_std
+                    camera_feats = c["vo_camera_feats"]  # now DQ (window_size, 8)
                     points_3d = c["points_3d"]
                     if not torch.is_tensor(points_3d):
                         points_3d = torch.tensor(points_3d, dtype=torch.float32)
@@ -205,7 +190,7 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     if not torch.is_tensor(gt_points_3d):
                         gt_points_3d = torch.tensor(gt_points_3d, dtype=torch.float32)
                     gt_points_3d = gt_points_3d.to(device)
-                    abs_poses_4x4 = c["vo_abs_poses_4x4"]
+                    abs_dq_cached = c["vo_abs_dq"]
 
                     if len(points_3d) < 10:
                         continue
@@ -220,12 +205,12 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     )
                     data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
 
-                    # c2c edges: prefer exact VO relative poses from cache, fall back to diffs
+                    # c2c edges: prefer exact VO relative DQ from cache, fall back to DQ diffs
                     c2c_index = torch.stack([
                         torch.arange(0, window_size - 1), torch.arange(1, window_size)
                     ], dim=0)
-                    if "vo_rel_poses" in c:
-                        c2c_attr = torch.tensor(c["vo_rel_poses"], dtype=torch.float32)
+                    if "vo_rel_dq" in c:
+                        c2c_attr = torch.tensor(c["vo_rel_dq"], dtype=torch.float32)
                     else:
                         cam_feats_t = data["camera"].x
                         _, c2c_attr = compute_normalized_c2c_edges(cam_feats_t, window_size)
@@ -240,9 +225,8 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                             "pt_mean": pt_mean,
                             "pt_std": pt_std,
                             "graph_obs": graph_obs,
-                            "camera_feats": camera_feats,
-                            "gt_rel": gt_relative_poses,
-                            "abs_poses_4x4": abs_poses_4x4,
+                            "gt_rel_dq": gt_rel_dq_cached,
+                            "abs_dq": abs_dq_cached,
                             "gt_points_3d": gt_points_3d,
                             "img_width": img_width,
                             "img_height": img_height,
@@ -288,42 +272,35 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 valid_data = []
                 for sample_idx in range(batch_size_eff):
                     tracks = all_tracks[sample_idx]
-                    gt_relative_poses = all_global_poses[sample_idx]
+                    gt_rel_dq = all_global_poses[sample_idx]  # (window_size-1, 8) DQ
                     img_height, img_width = all_img_dims[sample_idx]
                     vo_out = vo_output_np[sample_idx]  # (window_size-1, 6)
 
-                    # Denormalize relative poses and accumulate to absolute 4x4
-                    rel_poses_denorm = []
+                    # Denormalize relative poses, convert to DQ, accumulate to absolute DQ
+                    vo_rel_dq = []  # normalized 6-DOF → DQ relative
                     for i in range(vo_out.shape[0]):
                         euler = vo_out[i, :3] * std_angles_np + mean_angles_np
                         t = vo_out[i, 3:] * std_t_np + mean_t_np
-                        rel_poses_denorm.append(np.concatenate([euler, t]))
+                        vo_rel_dq.append(pose_6dof_to_dq(euler, t))
+                    vo_rel_dq = np.array(vo_rel_dq)  # (window_size-1, 8)
 
-                    abs_poses_4x4 = [np.eye(4)]
-                    for rel_pose in rel_poses_denorm:
-                        R = euler_to_rotation(rel_pose[:3], seq="zyx")
-                        T_rel = np.eye(4)
-                        T_rel[:3, :3] = R
-                        T_rel[:3, 3] = rel_pose[3:]
-                        abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
+                    # Accumulate to absolute DQ
+                    abs_dq = [dq_identity_np()]
+                    for rel_dq in vo_rel_dq:
+                        abs_dq.append(dq_mult_np(abs_dq[-1], rel_dq))
+                    abs_dq = np.array(abs_dq)  # (window_size, 8)
 
-                    # Convert absolute 4x4 poses to 6-DOF for GNN camera features
-                    abs_poses_6dof = []
-                    for pose in abs_poses_4x4:
-                        R = pose[:3, :3]
-                        t = pose[:3, 3]
-                        euler = rotation_to_euler(R, seq="zyx")
-                        abs_poses_6dof.append(np.concatenate([euler, t]))
-                    camera_feats = np.array(abs_poses_6dof)
-                    cam_mean = camera_feats.mean(axis=0)
-                    cam_std = camera_feats.std(axis=0).clip(min=1e-6)
-                    camera_feats = (camera_feats - cam_mean) / cam_std
+                    # Build 4x4 for triangulation compatibility (from DQ)
+                    abs_poses_4x4 = [dq_to_matrix_np(d) for d in abs_dq]
+
+                    # Camera features: absolute DQ poses (no normalization)
+                    camera_feats = abs_dq  # (window_size, 8)
 
                     if len(tracks) < 10:
                         continue
 
                     points_3d, graph_obs, valid_tracks = triangulate_all_points(
-                        tracks, abs_poses_4x4, K
+                        tracks, abs_dq, K
                     )
                     if len(points_3d) < 10:
                         continue
@@ -345,17 +322,15 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     )
                     data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
 
-                    # c2c edges: use EXACT VO-predicted relative pose (already normalized)
+                    # c2c edges: use DQ relative poses from VO
                     c2c_index = torch.stack([
                         torch.arange(0, window_size - 1), torch.arange(1, window_size)
                     ], dim=0)
                     data["camera", "temporal", "camera"].edge_index = c2c_index
-                    data["camera", "temporal", "camera"].edge_attr = torch.tensor(vo_out, dtype=torch.float32)
+                    data["camera", "temporal", "camera"].edge_attr = torch.tensor(vo_rel_dq, dtype=torch.float32)
                     data = data.to(device)
 
-                    # GT triangulation for point supervision (same tracks, no cheirality filter).
-                    # Make GT poses relative to first camera so they share the same
-                    # coordinate frame as VO-triangulated points (both anchored at identity).
+                    # GT triangulation for point supervision (same tracks, no cheirality filter)
                     gt_abs_poses_raw = batch_data["abs_poses"][sample_idx]
                     if isinstance(gt_abs_poses_raw, np.ndarray):
                         gt_abs_poses = gt_abs_poses_raw
@@ -363,8 +338,9 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                         gt_abs_poses = np.array(gt_abs_poses_raw)
                     T_inv = np.linalg.inv(gt_abs_poses[0])
                     gt_abs_poses_rel = [T_inv @ p for p in gt_abs_poses]
+                    gt_abs_dq = [matrix_to_dq_np(p) for p in gt_abs_poses_rel]
                     gt_points_3d = triangulate_tracks_no_filter(
-                        tracks, valid_tracks, gt_abs_poses_rel, K, device
+                        tracks, valid_tracks, gt_abs_dq, K, device
                     )
                     if not torch.is_tensor(gt_points_3d):
                         gt_points_3d = torch.tensor(
@@ -380,9 +356,8 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                             "pt_mean": pt_mean,
                             "pt_std": pt_std,
                             "graph_obs": graph_obs,
-                            "camera_feats": camera_feats,
-                            "gt_rel": gt_relative_poses,
-                            "abs_poses_4x4": abs_poses_4x4,
+                            "gt_rel_dq": gt_rel_dq,
+                            "abs_dq": abs_dq,
                             "gt_points_3d": gt_points_3d,
                             "img_width": img_width,
                             "img_height": img_height,
@@ -418,36 +393,26 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 graph_obs = sd["graph_obs"]
                 img_width = sd["img_width"]
                 img_height = sd["img_height"]
-                abs_poses_4x4 = sd["abs_poses_4x4"]
 
                 pred_rel_poses = pred_rel_poses_all[
                     edge_offset : edge_offset + n_edges_per_sample
                 ]
 
                 if pose_weight == 0.0:
-                    # Stage 1: use GT poses for reprojection so geometry is correct
-                    gt_rel = sd["gt_rel"]
-                    if isinstance(gt_rel, np.ndarray) and gt_rel.ndim == 3:
-                        gt_rel = gt_rel[0]
-                    gt_rel_tensor = torch.as_tensor(
-                        gt_rel, dtype=torch.float32, device=device
+                    gt_rel_dq_i = sd["gt_rel_dq"]
+                    if isinstance(gt_rel_dq_i, np.ndarray) and gt_rel_dq_i.ndim == 3:
+                        gt_rel_dq_i = gt_rel_dq_i[0]
+                    gt_rel_dq_tensor = torch.as_tensor(
+                        gt_rel_dq_i, dtype=torch.float32, device=device
                     )
-                    first_pose = torch.eye(4, device=device)
-                    pose_matrices = relative_poses_to_absolute_torch(
-                        gt_rel_tensor, first_pose, device
+                    first_pose_dq = dq_identity_torch((), device)
+                    abs_dq = relative_poses_to_absolute_dq_torch(
+                        gt_rel_dq_tensor, first_pose_dq, device
                     )
                 else:
-                    # Stage 2: use GNN-predicted poses
-                    pred_rel_denorm = pred_rel_poses.clone()
-                    pred_rel_denorm[:, :3] = (
-                        pred_rel_denorm[:, :3] * std_angles + mean_angles
-                    )
-                    pred_rel_denorm[:, 3:] = pred_rel_denorm[:, 3:] * std_t + mean_t
-                    first_pose = torch.tensor(
-                        abs_poses_4x4[0], dtype=torch.float32, device=device
-                    )
-                    pose_matrices = relative_poses_to_absolute_torch(
-                        pred_rel_denorm, first_pose, device
+                    first_pose_dq = dq_identity_torch((), device)
+                    abs_dq = relative_poses_to_absolute_dq_torch(
+                        pred_rel_poses, first_pose_dq, device
                     )
 
                 # Reprojection error using GNN-refined points
@@ -469,9 +434,8 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                     edge_offset += n_edges_per_sample
                     continue
 
-                # Reprojection error using GNN-refined points
                 projected = project_points_torch(
-                    points_3d_refined, pose_matrices, K, device
+                    points_3d_refined, abs_dq, K, device
                 )
                 cam_indices = edge_index[0]
                 pt_indices = edge_index[1]
@@ -479,31 +443,20 @@ def train_epoch(model, gnn_model, train_loader, optimizer, epoch, args, device, 
                 proj_y = projected[cam_indices, pt_indices, 1]
                 errors = torch.sqrt((proj_x - u_obs) ** 2 + (proj_y - v_obs) ** 2)
 
-                poses_w2c = torch.inverse(pose_matrices)
-                points_h = torch.cat(
-                    [points_3d_refined, torch.ones(n_pts, 1, device=device)], dim=1
-                )
-                points_cam = torch.matmul(poses_w2c[:, :3, :], points_h.T)
-                depths = points_cam[:, 2, :]
-                obs_depths = depths[cam_indices, pt_indices]
+                obs_depths = get_obs_depths_batch(abs_dq, points_3d_refined, cam_indices, pt_indices)
                 valid_errors = errors[obs_depths > 0.1]
 
-                # Pose supervision loss
-                gt_rel = sd["gt_rel"]
-                if isinstance(gt_rel, np.ndarray) and gt_rel.ndim == 3:
-                    gt_rel = gt_rel[0]
-                gt_rel_tensor = torch.as_tensor(
-                    gt_rel, dtype=torch.float32, device=device
+                # Pose supervision loss: geodesic SE(3) distance
+                gt_rel_dq_i = sd["gt_rel_dq"]
+                if isinstance(gt_rel_dq_i, np.ndarray) and gt_rel_dq_i.ndim == 3:
+                    gt_rel_dq_i = gt_rel_dq_i[0]
+                gt_rel_dq_tensor = torch.as_tensor(
+                    gt_rel_dq_i, dtype=torch.float32, device=device
                 )
-                gt_rel_norm = gt_rel_tensor.clone()
-                gt_rel_norm[:, :3] = (gt_rel_norm[:, :3] - mean_angles) / std_angles
-                gt_rel_norm[:, 3:] = (gt_rel_norm[:, 3:] - mean_t) / std_t
 
-                loss_angles = k * F.mse_loss(pred_rel_poses[:, :3], gt_rel_norm[:, :3])
-                loss_translation = F.mse_loss(pred_rel_poses[:, 3:], gt_rel_norm[:, 3:])
-                pose_loss = loss_angles + loss_translation
+                pose_loss = dq_geodesic_loss(pred_rel_poses, gt_rel_dq_tensor, k=k)
 
-                # Point triangulation loss: refined points vs GT triangulated points.
+                # Point triangulation loss
                 gt_pts = sd["gt_points_3d"]
                 if gt_pts.numel() > 0 and points_3d_refined.shape[0] == gt_pts.shape[0]:
                     point_loss = huber_loss(
@@ -584,15 +537,10 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
     total_error_optimized = 0
     num_samples = 0
 
-    mean_angles = KITTI_MEAN_ANGLES
-    std_angles = KITTI_STD_ANGLES
-    mean_t = KITTI_MEAN_T
-    std_t = KITTI_STD_T
-    # Torch tensors for GPU normalization
-    mean_angles_t = torch.tensor(mean_angles, dtype=torch.float32, device=device)
-    std_angles_t = torch.tensor(std_angles, dtype=torch.float32, device=device)
-    mean_t_t = torch.tensor(mean_t, dtype=torch.float32, device=device)
-    std_t_t = torch.tensor(std_t, dtype=torch.float32, device=device)
+    mean_angles_np = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    std_angles_np = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    mean_t_np = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    std_t_np = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
 
     # Resolution scaling
     orig_width, orig_height = 1241, 376
@@ -615,10 +563,10 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
 
                 if cache is not None and orig_idx in cache:
                     c = cache[orig_idx]
-                    vo_poses = c["vo_abs_poses_4x4"]
+                    vo_abs_dq = c["vo_abs_dq"]
                     points_3d = c["points_3d"]
                     graph_obs = c["graph_obs"]
-                    vo_rel = c.get("vo_rel_poses", None)  # may not exist in old caches
+                    vo_rel_dq_val = c.get("vo_rel_dq", None)
                 else:
                     # Preprocess images
                     pil_images = []
@@ -635,15 +583,27 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                     )
 
                     vo_output = model(imgs_batch)
-                    vo_rel = vo_output.detach().cpu()[0]  # (window_size-1, 6) normalized
-                    vo_poses = denormalize_poses(
-                        vo_output, window_size, mean_angles, std_angles, mean_t, std_t
-                    )[0]
+                    vo_out_val = vo_output.detach().cpu()[0]  # (window_size-1, 6) normalized
+
+                    # VO 6-DOF → DQ
+                    vo_rel_dq_val = []
+                    for i in range(vo_out_val.shape[0]):
+                        euler = vo_out_val[i, :3] * std_angles_np + mean_angles_np
+                        t = vo_out_val[i, 3:] * std_t_np + mean_t_np
+                        vo_rel_dq_val.append(pose_6dof_to_dq(euler, t))
+                    vo_rel_dq_val = np.array(vo_rel_dq_val)
+                    vo_rel_dq_val = torch.tensor(vo_rel_dq_val, dtype=torch.float32)
+
+                    # Accumulate to absolute DQ
+                    vo_abs_list = [dq_identity_np()]
+                    for rel_dq in vo_rel_dq_val.numpy():
+                        vo_abs_list.append(dq_mult_np(vo_abs_list[-1], rel_dq))
+                    vo_abs_dq = np.array(vo_abs_list)
 
                     if len(tracks) < 10:
                         continue
 
-                    points_3d, graph_obs, _ = triangulate_all_points(tracks, vo_poses, K)
+                    points_3d, graph_obs, _ = triangulate_all_points(tracks, vo_abs_dq, K)
                     if len(points_3d) < 10:
                         continue
 
@@ -661,52 +621,27 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                     window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
 
-                abs_poses_6dof = []
-                for pose in vo_poses:
-                    if isinstance(pose, torch.Tensor):
-                        pose = pose.cpu().numpy()
-                    R = pose[:3, :3]
-                    t = pose[:3, 3]
-                    euler = rotation_to_euler(R, seq="zyx")
-                    abs_poses_6dof.append(np.concatenate([euler, t]))
-                abs_poses_6dof = np.array(abs_poses_6dof)
+                data["camera"].x = torch.tensor(vo_abs_dq, dtype=torch.float32)
 
-                cam_mean = abs_poses_6dof.mean(axis=0)
-                cam_std = abs_poses_6dof.std(axis=0).clip(min=1e-6)
-                abs_poses_6dof_norm = (abs_poses_6dof - cam_mean) / cam_std
-                camera_feats_tensor = torch.tensor(abs_poses_6dof_norm, dtype=torch.float32)
-                data["camera"].x = camera_feats_tensor
-
-                # c2c edges: use exact VO relative poses if available, else fall back
+                # c2c edges: use DQ relative poses
                 c2c_index = torch.stack([
                     torch.arange(0, window_size - 1), torch.arange(1, window_size)
                 ], dim=0)
-                if vo_rel is not None:
+                if vo_rel_dq_val is not None:
                     data["camera", "temporal", "camera"].edge_index = c2c_index
-                    if not torch.is_tensor(vo_rel):
-                        vo_rel = torch.tensor(vo_rel, dtype=torch.float32)
-                    data["camera", "temporal", "camera"].edge_attr = vo_rel.clone().detach()
+                    if not torch.is_tensor(vo_rel_dq_val):
+                        vo_rel_dq_val = torch.tensor(vo_rel_dq_val, dtype=torch.float32)
+                    data["camera", "temporal", "camera"].edge_attr = vo_rel_dq_val.clone().detach()
                 data = data.to(device)
 
-                pred_rel_poses, point_refined = gnn_model(data, output_mode="relative")
+                pred_rel_dq, point_refined = gnn_model(data, output_mode="relative")
 
-                # Denormalize GNN output and compose absolute poses
-                pred_rel_poses_denorm = pred_rel_poses.clone()
-                pred_rel_poses_denorm[:, :3] = (
-                    pred_rel_poses_denorm[:, :3] * std_angles_t + mean_angles_t
+                # Compose absolute DQ from GNN predictions
+                first_pose_dq = dq_identity_torch((), device)
+                opt_abs_dq = relative_poses_to_absolute_dq_torch(
+                    pred_rel_dq, first_pose_dq, device
                 )
-                pred_rel_poses_denorm[:, 3:] = (
-                    pred_rel_poses_denorm[:, 3:] * std_t_t + mean_t_t
-                )
-
-                first_pose_tensor = torch.tensor(
-                    vo_poses[0], dtype=torch.float32, device=device
-                )
-                opt_abs_T = relative_poses_to_absolute_torch(
-                    pred_rel_poses_denorm, first_pose_tensor, device
-                )
-                opt_abs_np = opt_abs_T.cpu().numpy()
-                opt_poses = [opt_abs_np[i] for i in range(window_size)]
+                opt_abs_np = opt_abs_dq.cpu().numpy()  # (M, 8) DQ
 
                 # Denormalize GNN-refined points for optimized error
                 point_refined_denorm = point_refined * pt_std + pt_mean
@@ -716,11 +651,13 @@ def validate(model, gnn_model, val_loader, args, device, cache=None):
                     points_3d_np = points_3d.cpu().numpy()
                 else:
                     points_3d_np = points_3d
+
+                vo_abs_dq_np = vo_abs_dq if isinstance(vo_abs_dq, np.ndarray) else np.array(vo_abs_dq)
                 initial_error = compute_reprojection_error(
-                    vo_poses, points_3d_np, graph_obs, K, img_height, img_width
+                    vo_abs_dq_np, points_3d_np, graph_obs, K, img_height, img_width
                 )
                 optimized_error = compute_reprojection_error(
-                    opt_poses, opt_points_np, graph_obs, K, img_height, img_width
+                    opt_abs_np, opt_points_np, graph_obs, K, img_height, img_width
                 )
 
                 total_error_initial += initial_error
@@ -836,14 +773,27 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     raw_vo_outputs = np.concatenate(raw_vo_outputs, axis=0)
     print(f"Collected {len(raw_vo_outputs)} windows of raw outputs")
 
-    # ---- Step 2: Post-process VO outputs (merge overlapping windows) ----
-    print("Step 2: Applying post-processing...")
-    processed_poses = post_processing(raw_vo_outputs, window_size, overlap)
-    print(f"Processed poses shape: {processed_poses.shape}")
+    # ---- Step 2: Convert VO raw outputs (6-DOF normalized) to DQ ----
+    print("Step 2: Converting VO outputs to DQ...")
+    mean_angles_np = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    std_angles_np = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    mean_t_np = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    std_t_np = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
 
-    # ---- Step 3: Accumulate to get absolute VO poses ----
-    print("Step 3: Recovering trajectory...")
-    vo_poses, vo_trajectory = recover_trajectory_and_poses(processed_poses, norm=True)
+    vo_dq_list = []
+    for idx in range(raw_vo_outputs.shape[0]):
+        vo_out = raw_vo_outputs[idx]
+        rel_dqs = []
+        for i in range(vo_out.shape[0]):
+            euler = vo_out[i, :3] * std_angles_np + mean_angles_np
+            t = vo_out[i, 3:] * std_t_np + mean_t_np
+            rel_dqs.append(pose_6dof_to_dq(euler, t))
+        vo_dq_list.append(np.array(rel_dqs))
+
+    # ---- Step 3: Post-process and recover VO trajectory ----
+    print("Step 3: Recovering VO trajectory...")
+    processed_vo_dq = post_processing(np.array(vo_dq_list), window_size, overlap)
+    vo_poses, vo_trajectory = recover_trajectory_and_poses(processed_vo_dq, use_dq=True)
     print(f"Recovered {len(vo_poses)} absolute poses")
 
     # ---- Step 4: GNN optimization on each window (per-window VO, matching training) ----
@@ -856,11 +806,6 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     num_track_count_low = 0
     num_success = 0
     total_rel_norm = 0.0
-
-    mean_angles_np = KITTI_MEAN_ANGLES.copy()
-    std_angles_np = KITTI_STD_ANGLES.copy()
-    mean_t_np = KITTI_MEAN_T.copy()
-    std_t_np = KITTI_STD_T.copy()
 
     for idx in tqdm(range(len(dataset)), desc="GNN optimization"):
         sample = dataset[idx]
@@ -877,32 +822,22 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
         if len(tracks) >= 10:
             # Build absolute poses from per-window VO (match training, NOT merged global VO)
             vo_out = raw_vo_outputs[idx]  # (window_size-1, 6) normalized
-            rel_poses_denorm = []
+            vo_rel_dq = []
             for i in range(vo_out.shape[0]):
                 euler = vo_out[i, :3] * std_angles_np + mean_angles_np
                 t = vo_out[i, 3:] * std_t_np + mean_t_np
-                rel_poses_denorm.append(np.concatenate([euler, t]))
+                vo_rel_dq.append(pose_6dof_to_dq(euler, t))
+            vo_rel_dq = np.array(vo_rel_dq)
 
-            abs_poses_4x4 = [np.eye(4)]
-            for rel_pose in rel_poses_denorm:
-                R = euler_to_rotation(rel_pose[:3], seq="zyx")
-                T_rel = np.eye(4)
-                T_rel[:3, :3] = R
-                T_rel[:3, 3] = rel_pose[3:]
-                abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
+            # Accumulate to absolute DQ
+            abs_dq_list = [dq_identity_np()]
+            for rel_dq in vo_rel_dq:
+                abs_dq_list.append(dq_mult_np(abs_dq_list[-1], rel_dq))
+            vo_abs_dq = np.array(abs_dq_list)
 
-            # Convert to 6-DOF absolute poses for GNN camera features
-            abs_poses_6dof = []
-            for pose in abs_poses_4x4:
-                R = pose[:3, :3]
-                t = pose[:3, 3]
-                euler = rotation_to_euler(R, seq="zyx")
-                abs_poses_6dof.append(np.concatenate([euler, t]))
-            abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
-
-            # Triangulate 3D points using per-window VO poses
+            # Triangulate 3D points using per-window VO poses (DQ)
             points_3d, graph_obs, _ = triangulate_all_points(
-                tracks, abs_poses_4x4, K
+                tracks, vo_abs_dq, K
             )
 
             if len(points_3d) >= 10:
@@ -919,42 +854,43 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
                     window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
 
-                # Use per-window normalized absolute poses as GNN input
-                cam_mean = abs_poses_6dof.mean(axis=0)
-                cam_std = abs_poses_6dof.std(axis=0).clip(min=1e-6)
-                abs_poses_6dof_norm = (abs_poses_6dof - cam_mean) / cam_std
-                camera_feats_tensor = torch.tensor(abs_poses_6dof_norm, dtype=torch.float32)
+                # Use per-window absolute DQ as GNN camera input (no normalization)
+                camera_feats_tensor = torch.tensor(vo_abs_dq, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
 
-                # Explicit c2c edges using raw VO output (already normalized)
+                # Explicit c2c edges using DQ relative VO output
                 c2c_index = torch.stack([
                     torch.arange(0, window_size - 1), torch.arange(1, window_size)
                 ], dim=0)
-                c2c_attr = torch.tensor(raw_vo_outputs[idx], dtype=torch.float32)
+                c2c_attr = torch.tensor(vo_rel_dq, dtype=torch.float32)
                 data["camera", "temporal", "camera"].edge_index = c2c_index
                 data["camera", "temporal", "camera"].edge_attr = c2c_attr
                 data = data.to(device)
 
                 with torch.no_grad():
-                    pred_rel_poses, _ = gnn_model(data, output_mode="relative")
+                    pred_rel_dq, _ = gnn_model(data, output_mode="relative")
 
-                # Track relative pose magnitude for debugging (in normalized space)
-                rel_norm = torch.norm(pred_rel_poses).item()
+                # Track relative pose magnitude for debugging
+                rel_norm = torch.norm(pred_rel_dq).item()
                 total_rel_norm += rel_norm
 
-                num_success += 1
+                # GNN output is DQ; use directly for post-processing
+                pred_rel_np = pred_rel_dq.detach().cpu().numpy()
+                if np.any(np.isnan(pred_rel_np)):
+                    # Fallback to VO if GNN produced NaN
+                    opt_relative_poses_list.append(vo_rel_dq)
+                    continue
 
-                # GNN output is already normalized; use directly for post-processing
-                pred_rel_np = pred_rel_poses.detach().cpu().numpy()
+                num_success += 1
                 opt_relative_poses_list.append(pred_rel_np)
             else:
                 # Fallback: use VO output if triangulation fails
                 num_triangulation_failed += 1
-                opt_relative_poses_list.append(raw_vo_outputs[idx])
+                opt_relative_poses_list.append(vo_rel_dq)
         else:
             # Fallback: use VO output if too few tracks
             num_track_count_low += 1
-            opt_relative_poses_list.append(raw_vo_outputs[idx])
+            opt_relative_poses_list.append(np.zeros((window_size - 1, 8)))
 
     # Print debug statistics
     print(f"\nGNN Optimization Debug Stats:")
@@ -972,10 +908,10 @@ def predict_full_sequence(vo_model, gnn_model, dataset, args, device):
     opt_relative_poses = np.array(opt_relative_poses_list)
     print(f"Optimized relative poses shape: {opt_relative_poses.shape}")
 
-    # Post-process and accumulate
+    # Post-process and accumulate (DQ mode)
     processed_opt_poses = post_processing(opt_relative_poses, window_size, overlap)
     opt_poses_full, opt_trajectory = recover_trajectory_and_poses(
-        processed_opt_poses, norm=True
+        processed_opt_poses, use_dq=True
     )
     print(f"Recovered {len(opt_poses_full)} optimized absolute poses")
 
@@ -987,10 +923,10 @@ def build_vo_cache(vo_model, dataset, args, device, cache_path):
     vo_model.eval()
     window_size = args.window_size
 
-    mean_angles_np = KITTI_MEAN_ANGLES.copy()
-    std_angles_np = KITTI_STD_ANGLES.copy()
-    mean_t_np = KITTI_MEAN_T.copy()
-    std_t_np = KITTI_STD_T.copy()
+    mean_angles_np = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    std_angles_np = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    mean_t_np = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    std_t_np = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
 
     cache = {}
     batch_size = 64
@@ -1072,56 +1008,50 @@ def _triangulate_one_worker(args):
     Python/numpy types so there are no pickle issues with ProcessPoolExecutor."""
     idx, tracks, K, gt_abs, vo_out, mean_a, std_a, mean_t_, std_t_ = args
 
-    # Denormalize and accumulate
-    rel_poses_denorm = []
+    # Denormalize, convert to DQ, accumulate
+    vo_rel_dq = []
     for i in range(vo_out.shape[0]):
         euler = vo_out[i, :3] * std_a + mean_a
         t = vo_out[i, 3:] * std_t_ + mean_t_
-        rel_poses_denorm.append(np.concatenate([euler, t]))
+        vo_rel_dq.append(pose_6dof_to_dq(euler, t))
+    vo_rel_dq = np.array(vo_rel_dq)
 
-    abs_poses_4x4 = [np.eye(4)]
-    for rel_pose in rel_poses_denorm:
-        R = euler_to_rotation(rel_pose[:3], seq="zyx")
-        T_rel = np.eye(4)
-        T_rel[:3, :3] = R
-        T_rel[:3, 3] = rel_pose[3:]
-        abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
-
-    camera_feats = np.array([
-        np.concatenate([rotation_to_euler(p[:3, :3], seq="zyx"), p[:3, 3]])
-        for p in abs_poses_4x4
-    ])
+    abs_dq = [dq_identity_np()]
+    for rel_dq in vo_rel_dq:
+        abs_dq.append(dq_mult_np(abs_dq[-1], rel_dq))
+    abs_dq = np.array(abs_dq)
 
     if len(tracks) < 10:
         return idx, {
-            "vo_camera_feats": camera_feats,
-            "vo_rel_poses": vo_out,
+            "vo_camera_feats": abs_dq,
+            "vo_rel_dq": vo_rel_dq,
             "points_3d": np.zeros((0, 3)),
             "graph_obs": [],
             "gt_points_3d": np.zeros((0, 3)),
-            "vo_abs_poses_4x4": abs_poses_4x4,
+            "vo_abs_dq": abs_dq,
         }
 
     points_3d, graph_obs, valid_tracks = triangulate_all_points(
-        tracks, abs_poses_4x4, K, device="cpu"
+        tracks, abs_dq, K, device="cpu"
     )
 
     if len(points_3d) < 10:
         if isinstance(points_3d, torch.Tensor):
             points_3d = points_3d.cpu().numpy()
         return idx, {
-            "vo_camera_feats": camera_feats,
-            "vo_rel_poses": vo_out,
+            "vo_camera_feats": abs_dq,
+            "vo_rel_dq": vo_rel_dq,
             "points_3d": points_3d if isinstance(points_3d, np.ndarray) else np.array(points_3d),
             "graph_obs": graph_obs,
             "gt_points_3d": np.zeros((0, 3)),
-            "vo_abs_poses_4x4": abs_poses_4x4,
+            "vo_abs_dq": abs_dq,
         }
 
     T_inv = np.linalg.inv(gt_abs[0])
     gt_abs_rel = [T_inv @ p for p in gt_abs]
+    gt_abs_dq = [matrix_to_dq_np(p) for p in gt_abs_rel]
     gt_points_3d = triangulate_tracks_no_filter(
-        tracks, valid_tracks, gt_abs_rel, K, device="cpu"
+        tracks, valid_tracks, gt_abs_dq, K, device="cpu"
     )
     if isinstance(gt_points_3d, torch.Tensor):
         gt_points_3d = gt_points_3d.cpu().numpy()
@@ -1129,12 +1059,12 @@ def _triangulate_one_worker(args):
         points_3d = points_3d.cpu().numpy()
 
     return idx, {
-        "vo_camera_feats": camera_feats,
-        "vo_rel_poses": vo_out,
+        "vo_camera_feats": abs_dq,
+        "vo_rel_dq": vo_rel_dq,
         "points_3d": points_3d,
         "graph_obs": graph_obs,
         "gt_points_3d": gt_points_3d,
-        "vo_abs_poses_4x4": abs_poses_4x4,
+        "vo_abs_dq": abs_dq,
     }
 
 

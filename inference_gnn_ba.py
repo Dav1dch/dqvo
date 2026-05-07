@@ -19,18 +19,13 @@ from build_model import build_model
 from datasets.kitti_gnn import KITTIFeatureDataset
 from timesformer.models.gnn_ba import GNNBAOptimizer
 from utils.gnn_ba import (
-    KITTI_MEAN_ANGLES,
-    KITTI_STD_ANGLES,
-    KITTI_MEAN_T,
-    KITTI_STD_T,
     triangulate_all_points,
     build_heterogeneous_graph,
-    rotation_to_euler,
-    euler_to_rotation,
-    poses_to_camera_features,
+    pose_6dof_to_dq,
     post_processing,
     recover_trajectory_and_poses,
 )
+from utils.dq import dq_mult_np, dq_identity_np, dq_identity_torch, dq_to_matrix_torch, relative_poses_to_absolute_dq_torch
 
 preprocess = transforms.Compose(
     [
@@ -62,9 +57,14 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
     step_size = window_size - overlap
     num_windows = len(dataset)
 
-    # Step 1: Collect raw VO outputs (normalized relative poses) for all windows
+    # Step 1: Collect raw VO outputs (normalized 6-DOF relative poses) for all windows
     print("Step 1: Computing VO trajectory...")
-    vo_relative_poses = []
+    mean_angles_np = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    std_angles_np = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    mean_t_np = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    std_t_np = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
+
+    vo_relative_poses = []  # 6-DOF normalized
     for idx in tqdm(range(num_windows), desc="Collecting VO outputs"):
         sample = dataset[idx]
         pil_images = []
@@ -79,10 +79,20 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
         vo_output_np = vo_output.cpu().numpy()[0]  # (window_size-1, 6) normalized
         vo_relative_poses.append(vo_output_np)
 
-    # Post-process VO relative poses to get initial absolute trajectory
-    raw_vo_array = np.array(vo_relative_poses)  # (num_windows, window_size-1, 6)
-    processed_vo = post_processing(raw_vo_array, window_size, overlap)
-    vo_poses, vo_trajectory = recover_trajectory_and_poses(processed_vo, norm=True)
+    # Convert VO 6-DOF to DQ, post-process, recover trajectory
+    raw_vo_array = np.array(vo_relative_poses)
+    vo_dq_list = []
+    for idx in range(raw_vo_array.shape[0]):
+        vo_out = raw_vo_array[idx]
+        rel_dqs = []
+        for i in range(vo_out.shape[0]):
+            euler = vo_out[i, :3] * std_angles_np + mean_angles_np
+            t = vo_out[i, 3:] * std_t_np + mean_t_np
+            rel_dqs.append(pose_6dof_to_dq(euler, t))
+        vo_dq_list.append(np.array(rel_dqs))
+
+    processed_vo = post_processing(np.array(vo_dq_list), window_size, overlap)
+    vo_poses, vo_trajectory = recover_trajectory_and_poses(processed_vo, use_dq=True)
     print(f"VO trajectory: {len(vo_poses)} poses")
 
     # Step 2: Run GNN on each window, collect optimized relative poses
@@ -93,10 +103,10 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
     num_triangulation_failed = 0
     num_track_count_low = 0
 
-    mean_angles_np = KITTI_MEAN_ANGLES.copy()
-    std_angles_np = KITTI_STD_ANGLES.copy()
-    mean_t_np = KITTI_MEAN_T.copy()
-    std_t_np = KITTI_STD_T.copy()
+    mean_angles_np = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
+    std_angles_np = np.array([2.8256e-3, 1.7771e-2, 3.2326e-3])
+    mean_t_np = np.array([-8.6736e-5, -1.6038e-2, 9.0033e-1])
+    std_t_np = np.array([2.5584e-2, 1.8545e-2, 3.0352e-1])
 
     for idx in tqdm(range(num_windows), desc="GNN optimization"):
         sample = dataset[idx]
@@ -113,31 +123,20 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
         if len(tracks) >= 10:
             # Build absolute poses from per-window VO (match training, NOT merged global VO)
             vo_out = vo_relative_poses[idx]  # (window_size-1, 6) normalized
-            rel_poses_denorm = []
+            vo_rel_dq = []
             for i in range(vo_out.shape[0]):
                 euler = vo_out[i, :3] * std_angles_np + mean_angles_np
                 t = vo_out[i, 3:] * std_t_np + mean_t_np
-                rel_poses_denorm.append(np.concatenate([euler, t]))
+                vo_rel_dq.append(pose_6dof_to_dq(euler, t))
+            vo_rel_dq = np.array(vo_rel_dq)
 
-            abs_poses_4x4 = [np.eye(4)]
-            for rel_pose in rel_poses_denorm:
-                R = euler_to_rotation(rel_pose[:3], seq="zyx")
-                T_rel = np.eye(4)
-                T_rel[:3, :3] = R
-                T_rel[:3, 3] = rel_pose[3:]
-                abs_poses_4x4.append(abs_poses_4x4[-1] @ T_rel)
+            abs_dq_list = [dq_identity_np()]
+            for rel_dq in vo_rel_dq:
+                abs_dq_list.append(dq_mult_np(abs_dq_list[-1], rel_dq))
+            vo_abs_dq = np.array(abs_dq_list)
 
-            # Convert to 6-DOF for camera features
-            abs_poses_6dof = []
-            for pose in abs_poses_4x4:
-                R = pose[:3, :3]
-                t = pose[:3, 3]
-                euler = rotation_to_euler(R, seq="zyx")
-                abs_poses_6dof.append(np.concatenate([euler, t]))
-            abs_poses_6dof = np.array(abs_poses_6dof)  # denorm
-
-            # Triangulate 3D points using per-window VO poses
-            points_3d, graph_obs, _ = triangulate_all_points(tracks, abs_poses_4x4, K)
+            # Triangulate 3D points using per-window VO poses (DQ)
+            points_3d, graph_obs, _ = triangulate_all_points(tracks, vo_abs_dq, K)
             if len(points_3d) >= 10:
                 # Normalize points for GNN input
                 if not torch.is_tensor(points_3d):
@@ -150,47 +149,40 @@ def predict_sequence_simple(vo_model, gnn_model, dataset, args, device):
                 data = build_heterogeneous_graph(
                     window_size, points_3d_norm, graph_obs, img_height, img_width
                 )
-                # Use per-window normalized absolute poses as GNN input (match training)
-                cam_mean = abs_poses_6dof.mean(axis=0)
-                cam_std = abs_poses_6dof.std(axis=0).clip(min=1e-6)
-                abs_poses_6dof_norm = (abs_poses_6dof - cam_mean) / cam_std
-                camera_feats_tensor = torch.tensor(abs_poses_6dof_norm, dtype=torch.float32)
+                # Use per-window absolute DQ as GNN input (no normalization)
+                camera_feats_tensor = torch.tensor(vo_abs_dq, dtype=torch.float32)
                 data["camera"].x = camera_feats_tensor
-                # c2c edges: use exact VO relative pose (already normalized)
+                # c2c edges: use VO relative DQ
                 c2c_index = torch.stack([
                     torch.arange(0, window_size - 1), torch.arange(1, window_size)
                 ], dim=0)
-                c2c_attr = torch.tensor(vo_relative_poses[idx], dtype=torch.float32)
+                c2c_attr = torch.tensor(vo_rel_dq, dtype=torch.float32)
                 data["camera", "temporal", "camera"].edge_index = c2c_index
                 data["camera", "temporal", "camera"].edge_attr = c2c_attr
                 data = data.to(device)
 
                 with torch.no_grad():
-                    pred_rel_poses, _ = gnn_model(data, output_mode="relative")
-                rel_pose_norms.append(torch.norm(pred_rel_poses).item())
+                    pred_rel_dq, _ = gnn_model(data, output_mode="relative")
+                rel_pose_norms.append(torch.norm(pred_rel_dq).item())
 
-                # GNN output is already normalized; use directly for post-processing
-                pred_rel_np = pred_rel_poses.detach().cpu().numpy()
+                # GNN output is DQ; use directly for post-processing
+                pred_rel_np = pred_rel_dq.detach().cpu().numpy()
                 opt_relative_poses_list.append(pred_rel_np)
                 num_success += 1
             else:
-                # Fallback: use VO relative poses for this window
+                # Fallback: use VO relative DQ for this window
                 num_triangulation_failed += 1
-                opt_relative_poses_list.append(vo_relative_poses[idx])
+                opt_relative_poses_list.append(vo_rel_dq)
         else:
-            # Fallback: use VO relative poses for this window
+            # Fallback: use VO relative DQ for this window
             num_track_count_low += 1
-            opt_relative_poses_list.append(vo_relative_poses[idx])
+            opt_relative_poses_list.append(np.zeros((window_size - 1, 8)))
 
-    # Step 3: Merge optimized relative poses and recover absolute trajectory
-    opt_relative_poses_array = np.array(
-        opt_relative_poses_list
-    )  # (num_windows, window_size-1, 6)
-    processed_opt_relative = post_processing(
-        opt_relative_poses_array, window_size, overlap
-    )
+    # Step 3: Merge optimized relative DQ poses and recover absolute trajectory
+    opt_relative_poses_array = np.array(opt_relative_poses_list)
+    processed_opt_relative = post_processing(opt_relative_poses_array, window_size, overlap)
     opt_poses, opt_trajectory = recover_trajectory_and_poses(
-        processed_opt_relative, norm=True
+        processed_opt_relative, use_dq=True
     )
     print(f"Optimized trajectory: {len(opt_poses)} poses")
     if rel_pose_norms:

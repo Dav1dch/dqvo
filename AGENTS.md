@@ -1,10 +1,10 @@
 # GNN-BA-VO Agent Guidelines
 
-GNN-optimized monocular visual odometry: a frozen Vision Transformer provides initial pose estimates, and a Graph Neural Network Bundle Adjustment (GNN-BA) module refines them by minimizing reprojection error. Based on KITTI dataset.
+GNN-optimized monocular visual odometry: a frozen Vision Transformer provides initial 6-DOF pose estimates, which are converted to **dual quaternions** (DQ), and a GNN-BA module refines them by minimizing geodesic SE(3) loss + reprojection error. Based on KITTI dataset.
 
 ## Setup
 
-- **Python**: 3.8+ (originally pinned to 3.8.0; currently runs on 3.10)
+- **Python**: 3.8+ (currently 3.10)
 - **Data**: softlink `data/` → KITTI `sequences_jpg/` and `poses/`. Each sequence dir must contain `image_2/*.png` and `calib.txt`.
 - **VO checkpoint**: must exist at `checkpoints/Exp51/checkpoint_best.pth` before VO-based GNN training.
 - **PyTorch Geometric**: install `torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric -f https://data.pyg.org/whl/torch-1.10.0+cu113.html`
@@ -30,28 +30,90 @@ python predict_poses.py            # Legacy VO inference
 | `train_gnn_ba_noisy.py` | Noisy-GT GNN training (no VO) | KITTI only |
 | `inference_gnn_ba.py` | VO + GNN full-sequence eval | VO ckpt, GNN ckpt |
 | `inference_gnn_ba_noisy.py` | Noisy-GT GNN full-sequence eval | GNN ckpt |
-| `gnn_ba_test.py` | Single-window debug (uses `image_0`, ORB matching) | KITTI only |
-| `timesformer/models/gnn_ba.py` | `GNNBAOptimizer` — shared by all scripts | |
+| `gnn_ba_test.py` | Single-window debug (`image_0`, ORB matching) | KITTI only |
+| `timesformer/models/gnn_ba.py` | `GNNBAOptimizer` — shared GNN model | |
 | `datasets/kitti_gnn.py` | `KITTIFeatureDataset` — shared dataloader | |
 | `utils/gnn_ba.py` | triangulation, graph building, losses, post-processing | |
+| `utils/dq.py` | **all** DQ algebra (numpy + torch) — `dq_mult`, `dq_inverse`, `dq_geodesic_loss`, `dq_transform_points_batch_torch`, etc. | |
 
-## Critical Architecture Details
+## Dual Quaternion Architecture
 
-### GNN output is residual
-`gnn_ba.py` line ~401: `camera_relative = c2c_edge_attr + c2c_delta`. The GNN adds a learned correction to the input c2c edge features. Initialization (gain=0.01) outputs near-zero delta, so prediction starts at the input pose. This is essential for convergence — without it the GNN starts at zero output (≈ mean pose) and cannot learn turns.
+The entire GNN pipeline uses dual quaternions (8-D) as the sole pose representation. No 4×4 matrices or Euler angles are used internally for pose operations.
 
-### c2c edges must use exact relative poses
-c2c edge features must be the **actual relative pose** (6-DOF, normalized), NOT absolute-pose differences. For VO mode: use the VO model's raw normalized output. For noisy mode: use the exact noisy relative pose. The legacy `compute_normalized_c2c_edges()` uses Euler-angle/translation diffs of absolute poses, which are approximate and cause poor convergence.
+### DQ Convention
 
-### Point loss uses `.mean()` not `.sum()`
-`train_gnn_ba.py` line ~497: point loss is `huber_loss(…).mean()`. A previous `.sum()` version inflated the loss 100-200× per sample, dominating training and causing loss-clip filtering.
+`d = q_r + ε q_d` where `q_r ∈ S³` (unit quaternion), `q_d = ½ t_q ⊗ q_r` with `t_q = [0, tx, ty, tz]`. Stored as `[qw, qx, qy, qz, q'w, q'x, q'y, q'z]` (8 elements).
 
-### Validation measures full GNN refinement
-Validation optimized error now uses **GNN-refined points** (not the stale VO-triangulated points), so it measures joint pose+point improvement.
+### Data flow (VO mode)
+
+```
+VO model → 6-DOF normalized → denormalize → pose_6dof_to_dq() → accumulate DQ
+    → camera.x = absolute DQ (8-D, no normalization)
+    → c2c edge_attr = relative DQ from VO
+    → GNN: embed 8→hidden, output 8 (bias=identity DQ)
+    → d_correction = dq_normalize_torch(output)
+    → d_output = dq_mult_torch(d_correction, d_input)   # multiplicative residual
+    → loss = dq_geodesic_loss(pred, gt) + reproj + point
+```
+
+### GT poses in dataset
+
+`datasets/kitti_gnn.py` returns `global_poses` as `(window_size-1, 8)` DQ relative poses (built via `matrix_to_dq_np(inv(T_i) @ T_{i+1})`). `abs_poses` remains as 4×4 for GT triangulation.
+
+## Critical DQ Gotchas
+
+### `dq_inverse` ≠ `dq_conj`
+
+For SE(3) DQs, the conjugate (`q_r* - ε q_d*`) does NOT equal the inverse. The correct inverse is computed by extracting R,t, inverting them, and re-encoding via `dq_inverse_torch()` / `dq_inverse_np()`. Use `dq_inverse` for:
+- Computing w2c from c2w (triangulation, projection)
+- Computing relative poses from absolute poses (`d_rel = d_i^{-1} ⊗ d_j`)
+- The geodesic loss error computation
+
+`dq_conj` is kept available but is rarely needed.
+
+### `torch.linalg.svd` NOT `torch.svd`
+
+`torch.svd` gives numerically wrong results on poorly-conditioned A matrices (common in DLT triangulation). Always use `torch.linalg.svd(A)` for SVD in DLT. Applied in `triangulate_dlt`, `_triangulate_track_gpu`, and `triangulate_from_graph_obs`.
+
+### DLT uses pixel coords, not normalized coords
+
+When building DLT constraints from projection rows `P = K @ [R | t]`, use `u * P[2] - P[0]` (raw pixel coordinates), NOT `(u-cx)/fx * P[2] - P[0]` (normalized coordinates). The latter produces wrong results. Applied in `_triangulate_track_gpu`.
+
+### DQ point transform: extract R,t, don't use quaternion formula
+
+The naive dual quaternion point transform formula (`d ⊗ X_q ⊗ conj(d)`) was buggy. Instead, extract R and t from the DQ, then use `R @ X + t`. Both `dq_transform_point_torch` and `dq_transform_points_batch_torch` use this approach.
+
+## Triangulation Optimization
+
+`triangulate_all_points` and `triangulate_tracks_no_filter` use `_precompute_camera_proj()` to compute all camera projection rows (P_u, P_v, P_z as 4-vectors) once, then run per-track DLT via `_triangulate_track_gpu` which uses GPU tensor indexing (no inner loops). The cheirality check is also batched. This gives ~5× speedup over per-observation DQ extraction.
+
+**Keep triangulation on CPU** — data-transfer overhead (many small tensors per track) makes GPU slower for KITTI-scale data (3 cameras, 6×4 SVD).
+
+## VO Model Constants
+
+The VO model outputs **normalized 6-DOF** `[euler_z, euler_y, euler_x, tx, ty, tz]`. These normalization stats are needed for denormalization before DQ conversion and are inlined in each training/inference script (hardcoded numpy arrays):
+
+```python
+mean_angles = [1.7061e-5,  9.5582e-4, -5.5258e-5]
+std_angles  = [2.8256e-3,  1.7771e-2,  3.2326e-3]
+mean_t      = [-8.6736e-5, -1.6038e-2,  9.0033e-1]
+std_t       = [2.5584e-2,  1.8545e-2,  3.0352e-1]
+```
+
+Do not change these without retraining the VO model. The DQ GNN does NOT use these stats (DQ is unnormalized).
+
+## GNN Model Details
+
+- **Embedding**: camera 8→hidden, c2c_edge 8→hidden, point 3→hidden, p2c_edge 2→hidden
+- **Output heads**: `camera_out_proj` hidden→8, `c2c_pose_out_proj` hidden→8 (both `bias=True` with identity DQ bias `[1,0,0,0,0,0,0,0]`)
+- **Weight init**: Xavier `gain=0.001` for DQ output heads (must be small—DQ output is multiplicative, not additive). Point output uses `gain=1.0`.
+- **Output normalization**: `dq_normalize_torch()` projects raw output to valid DQ manifold (unit real part, orthogonal dual)
+- **Message passing**: 6 layers in order: c2c_edge → camera←point → point←camera → c2c_edge
+- **VO model is frozen** — `model.eval()` with `torch.no_grad()`. Only GNN parameters get gradients.
 
 ## Training Workflows
 
-### VO mode — multi-sequence with cache
+### VO mode — multi-sequence with cache (fast)
 ```bash
 # 1. Build cache (once, ~minutes)
 python train_gnn_ba.py --checkpoint checkpoints/Exp51/checkpoint_best.pth \
@@ -63,10 +125,10 @@ python train_gnn_ba.py --checkpoint checkpoints/Exp51/checkpoint_best.pth \
     --cache vo_cache.pt --num_epochs 20
 ```
 
-### VO mode — single sequence (no cache)
+### VO mode — single sequence (slow, no cache)
 ```bash
 python train_gnn_ba.py --checkpoint checkpoints/Exp51/checkpoint_best.pth \
-    --sequence 03 --num_epochs 10
+    --sequence 03 --num_epochs 10 --point_weight 0.1
 ```
 
 ### Noisy-GT mode (no VO model)
@@ -76,29 +138,29 @@ python train_gnn_ba_noisy.py --sequence 03 --num_epochs 50
 
 ## DataLoader / Multiprocessing
 
-**Use `num_workers=0` by default.** The environment has two IPC issues:
-1. `RuntimeError: received 0 items of ancdata` — file descriptor exhaustion when PyG tensors are transferred across workers
-2. `torch_shm_manager: Permission denied` — `file_system` sharing strategy unavailable
+**Use `num_workers=0` by default.** Two IPC issues:
+1. `RuntimeError: received 0 items of ancdata` — fd exhaustion with PyG tensors across workers
+2. `torch_shm_manager: Permission denied` — `file_system` sharing unavailable
 
-The noisy script defaults to `num_workers=0`. The VO script uses 8 workers in the original code but may crash on long runs. If pushing workers, set `persistent_workers=False`.
+The noisy script defaults to `num_workers=0`. The VO cache builder uses `ProcessPoolExecutor` for CPU triangulation (safe — only numpy arrays, no CUDA tensors).
 
 ## Key Defaults
 
 - `window_size=3`, `overlap=2`, `batch_size=16`
-- `hidden_dim=128`, `num_layers=6`, `lr=1e-4`
+- `hidden_dim=256` (VO) / `128` (noisy), `num_layers=6`, `lr=5e-5` (VO) / `1e-4` (noisy)
 - `reproj_weight=0.01`, `pose_weight=1.0`, `point_weight=0.1`
-- `weighted_loss=3.0` (k multiplier on angle MSE), `loss_clip=500`
+- `weighted_loss=3.0` (k multiplier on rotation part of geodesic loss), `loss_clip=500`
 - VO model: `dim=384`, `depth=16`, `heads=6`, `image_size=(224,672)`, `patch_size=16`
-- Pose normalization stats: `KITTI_MEAN_ANGLES`, `KITTI_STD_ANGLES`, `KITTI_MEAN_T`, `KITTI_STD_T` in `utils/gnn_ba.py`. Do not change without retraining.
 - Image normalization: mean `[0.3472, 0.3671, 0.3607]`, std `[0.3074, 0.3152, 0.3202]`
 
 ## Common Pitfalls
 
-- **VO model is frozen** — only GNN parameters get gradients. Calling `model.train()` is a bug.
-- **GNN output layers have no bias** (`bias=False`) and Xavier init with `gain=0.01` for pose outputs.
-- **`calib.txt` reads P2 line** (color camera intrinsics). The dataset loads from `image_2/` (color cam). `gnn_ba_test.py` uses `image_0/` (grayscale, different intrinsics — P0 line).
-- **Device placement**: camera features are denormalized absolute 6-DOF (on CPU during graph building, moved to GPU via `.to(device)`). Normalization tensors (`mean_angles`, etc.) must match the device of the data they operate on.
-- **`gnn_ba_output/` is not gitignored** — avoid committing trained models or output poses.
+- **Training is slow without cache** — the ViT VO model (depth=16, dim=384) dominates. Use `--build_cache` then `--cache` for fast training.
+- **GNN output gains must be small** — `gain=0.001` for DQ output heads. DQ residual is multiplicative, not additive like the old 6-DOF code.
+- **Post-processing averages DQs on SE(3) manifold** — `_dq_average_np()` extracts R,t, averages in log-space, re-encodes. Simple 8-D vector averaging produces invalid DQs that cause trajectory oscillation.
+- **`calib.txt` reads P2 line** (color camera intrinsics). `image_2/` (color). `gnn_ba_test.py` uses `image_0/` (grayscale, different intrinsics — P0 line).
+- **Cache builder uses CPU** — `_triangulate_one_worker` runs in `ProcessPoolExecutor`, cannot use CUDA.
+- **`gnn_ba_output/` is not gitignored** — avoid committing output files.
 - **CUDA OOM**: reduce `batch_size`.
 
 ## Git Ignore

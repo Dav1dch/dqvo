@@ -23,8 +23,19 @@ from utils.gnn_ba import (
     build_heterogeneous_graph,
     project_points_torch,
     compute_reprojection_error,
-    euler_to_rotation_torch,
     huber_loss,
+)
+from utils.dq import (
+    matrix_to_dq_np,
+    dq_to_matrix_np,
+    dq_identity_torch,
+    dq_identity_np,
+    dq_mult_torch,
+    dq_mult_np,
+    dq_conj_torch,
+    dq_conj_np,
+    dq_transform_point_torch,
+    relative_poses_to_absolute_dq_torch,
 )
 from timesformer.models.gnn_ba import GNNBAOptimizer
 
@@ -152,8 +163,8 @@ def axis_angle_to_rotation_matrix(axis_angle: np.ndarray) -> np.ndarray:
 
 def add_noise_to_poses(poses: list, trans_noise: float = 0.2,
                        rot_noise: float = 0.05) -> list:
-    """Add noise to ground truth poses to simulate VO initialization."""
-    noisy_poses = []
+    """Add noise to ground truth poses to simulate VO initialization. Returns DQ list."""
+    noisy_dqs = []
     for pose in poses:
         t_noise = np.random.randn(3) * trans_noise
         new_t = pose[:3, 3] + t_noise
@@ -163,8 +174,8 @@ def add_noise_to_poses(poses: list, trans_noise: float = 0.2,
         new_pose = np.eye(4)
         new_pose[:3, :3] = new_R
         new_pose[:3, 3] = new_t
-        noisy_poses.append(new_pose)
-    return noisy_poses
+        noisy_dqs.append(matrix_to_dq_np(new_pose))
+    return noisy_dqs
 
 
 # =============================================================================
@@ -211,13 +222,14 @@ def run_gnn_ba(kitti_root: str, sequence: str = '00', num_frames: int = 5,
     tracks = build_track_matches(images, match_data)
     print(f"Built {len(tracks)} tracks across {num_frames} frames.")
     
-    # Create noisy initial poses (c2w 4x4)
+    # Create noisy initial poses (DQ)
     print("\nAdding noise to ground truth poses...")
-    initial_poses = add_noise_to_poses(gt_poses, trans_noise=0.2, rot_noise=0.05)
+    initial_dqs = add_noise_to_poses(gt_poses, trans_noise=0.2, rot_noise=0.05)
+    initial_poses_4x4 = [dq_to_matrix_np(dq) for dq in initial_dqs]
     
-    # Triangulate 3D points using initial poses
+    # Triangulate 3D points using initial poses (DQ)
     print("Triangulating 3D points...")
-    points_3d, observations, _ = triangulate_all_points(tracks, initial_poses, K)
+    points_3d, observations, _ = triangulate_all_points(tracks, initial_dqs, K)
     if len(points_3d) < 10:
         print("Error: Not enough 3D points after triangulation")
         return
@@ -233,36 +245,28 @@ def run_gnn_ba(kitti_root: str, sequence: str = '00', num_frames: int = 5,
     # Build heterogeneous graph (only observation edges)
     data = build_heterogeneous_graph(num_frames, points_3d_norm, observations, img_height, img_width)
     
-    # Set camera node features: Euler angles (zyx) + translation from initial poses
-    camera_feats = []
-    for pose in initial_poses:
-        R = pose[:3, :3]
-        t = pose[:3, 3]
-        euler = Rotation.from_matrix(R).as_euler('zyx').astype(np.float32)
-        camera_feats.append(np.concatenate([euler, t]))
-    camera_feats = np.stack(camera_feats, axis=0)  # (num_frames, 6)
-    data['camera'].x = torch.tensor(camera_feats, dtype=torch.float32)
+    # Set camera node features: DQ absolute poses
+    data['camera'].x = torch.tensor(np.array(initial_dqs), dtype=torch.float32)
+
+    # Compute relative DQ for c2c edges: d_rel = conj(d_i) * d_{i+1}
+    rel_dqs_np = []
+    for i in range(num_frames - 1):
+        d_inv = dq_conj_np(initial_dqs[i])
+        rel = dq_mult_np(d_inv, initial_dqs[i+1])
+        rel_dqs_np.append(rel)
+
+    c2c_index = torch.stack([torch.arange(0, num_frames - 1), torch.arange(1, num_frames)], dim=0)
+    data['camera', 'temporal', 'camera'].edge_index = c2c_index
+    data['camera', 'temporal', 'camera'].edge_attr = torch.tensor(np.array(rel_dqs_np), dtype=torch.float32)
     
     # Move to device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     data = data.to(device)
     points_3d = points_3d.to(device)
     
-    # Helper: compose absolute poses from relative predictions
-    def relative_poses_to_absolute_torch(relative_poses, first_abs_pose, device):
-        """Compose relative 6-DoF poses (Euler zyx + trans) into absolute 4x4 c2w poses."""
-        rel_R = euler_to_rotation_torch(relative_poses[:, :3], seq="zyx")
-        rel_T = torch.eye(4, dtype=torch.float32, device=device).unsqueeze(0).repeat(relative_poses.shape[0], 1, 1)
-        rel_T[:, :3, :3] = rel_R
-        rel_T[:, :3, 3] = relative_poses[:, 3:]
-        abs_list = [first_abs_pose]
-        for i in range(rel_T.shape[0]):
-            abs_list.append(abs_list[-1] @ rel_T[i])
-        return torch.stack(abs_list, dim=0)
-    
     # Compute initial reprojection error
     initial_error = compute_reprojection_error(
-        initial_poses, points_3d.cpu().numpy(), observations, K, img_height, img_width
+        initial_dqs, points_3d.cpu().numpy(), observations, K, img_height, img_width
     )
     print(f"\nInitial reprojection error (normalized): {initial_error:.4f}")
     
@@ -279,15 +283,15 @@ def run_gnn_ba(kitti_root: str, sequence: str = '00', num_frames: int = 5,
         model.train()
         optimizer.zero_grad()
         
-        # Forward pass: get predicted relative poses (c2c) and refined points
-        pred_rel_poses, point_refined = model(data, output_mode="relative")
+        # Forward pass
+        pred_rel_dq, point_refined = model(data, output_mode="relative")
         
-        # Compose absolute camera-to-world poses
-        first_pose_tensor = torch.tensor(initial_poses[0], dtype=torch.float32, device=device)
-        abs_poses = relative_poses_to_absolute_torch(pred_rel_poses, first_pose_tensor, device)
+        # Compose absolute DQ
+        first_dq = dq_identity_torch((), device)
+        abs_dqs = relative_poses_to_absolute_dq_torch(pred_rel_dq, first_dq, device)
         
-        # Reprojection loss using fixed triangulated points
-        proj = project_points_torch(points_3d, abs_poses, K, device)  # (M, N, 2)
+        # Reprojection loss
+        proj = project_points_torch(points_3d, abs_dqs, K, device)
         edge_index = data['camera', 'observes', 'point'].edge_index
         edge_attr = data['camera', 'observes', 'point'].edge_attr
         u_obs = edge_attr[:, 0] * img_width
@@ -298,11 +302,12 @@ def run_gnn_ba(kitti_root: str, sequence: str = '00', num_frames: int = 5,
         errors = torch.sqrt((proj_x - u_obs)**2 + (proj_y - v_obs)**2)
         
         # Depth validity mask
-        poses_w2c = torch.inverse(abs_poses)
-        points_h = torch.cat([points_3d, torch.ones(points_3d.shape[0], 1, device=device)], dim=1)
-        points_cam = torch.matmul(poses_w2c[:, :3, :], points_h.T)
-        depths = points_cam[:, 2, :]
-        obs_depths = depths[edge_index[0], edge_index[1]]
+        dqs_w2c = dq_conj_torch(abs_dqs)
+        depths = []
+        for ci, pi in zip(edge_index[0].tolist(), edge_index[1].tolist()):
+            X_cam = dq_transform_point_torch(dqs_w2c[ci:ci+1], points_3d[pi:pi+1])
+            depths.append(X_cam[0, 2])
+        obs_depths = torch.tensor(depths, device=device)
         valid_mask = obs_depths > 0.1
         valid_errors = errors[valid_mask]
         
@@ -311,8 +316,8 @@ def run_gnn_ba(kitti_root: str, sequence: str = '00', num_frames: int = 5,
         else:
             reproj_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
-        # Pose regularization (encourage small updates)
-        pose_reg = torch.norm(pred_rel_poses)**2
+        # Pose regularization (encourage small corrections)
+        pose_reg = torch.norm(pred_rel_dq)**2
         
         loss = reproj_loss * reproj_weight + pose_reg * pose_weight
         
@@ -327,11 +332,15 @@ def run_gnn_ba(kitti_root: str, sequence: str = '00', num_frames: int = 5,
         # Logging
         if epoch % 10 == 0:
             with torch.no_grad():
-                abs_np = abs_poses.detach().cpu().numpy()
+                abs_dq_np = abs_dqs.detach().cpu()
+                abs_np = []
+                for dq_t in abs_dq_np:
+                    T = dq_to_matrix_np(dq_t.numpy())
+                    abs_np.append(T)
                 current_error = compute_reprojection_error(
                     abs_np, points_3d.cpu().numpy(), observations, K, img_height, img_width
                 )
-                delta_norm = torch.norm(pred_rel_poses).item()
+                delta_norm = torch.norm(pred_rel_dq).item()
             print(f"Epoch {epoch:3d}: Loss = {loss.item():.6f}, RMSE = {current_error:.4f}, delta_norm = {delta_norm:.6f}")
             error_history.append(current_error)
             delta_norm_history.append(delta_norm)
@@ -340,9 +349,11 @@ def run_gnn_ba(kitti_root: str, sequence: str = '00', num_frames: int = 5,
     model.eval()
     with torch.no_grad():
         pred_rel_final, _ = model(data, output_mode="relative")
-        final_abs = relative_poses_to_absolute_torch(pred_rel_final, first_pose_tensor, device)
+        abs_dq_final = relative_poses_to_absolute_dq_torch(pred_rel_final, dq_identity_torch((), device), device)
+        abs_dq_final_np = abs_dq_final.detach().cpu()
+        final_abs_np = [dq_to_matrix_np(dq_t.numpy()) for dq_t in abs_dq_final_np]
         final_error = compute_reprojection_error(
-            final_abs.detach().cpu().numpy(), points_3d.cpu().numpy(), observations, K, img_height, img_width
+            final_abs_np, points_3d.cpu().numpy(), observations, K, img_height, img_width
         )
     
     print("\n" + "="*60)

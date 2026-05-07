@@ -18,36 +18,47 @@ from tqdm import tqdm
 from datasets.kitti_gnn import KITTIFeatureDataset
 from timesformer.models.gnn_ba import GNNBAOptimizer
 from utils.gnn_ba import (
-    KITTI_MEAN_ANGLES,
-    KITTI_STD_ANGLES,
-    KITTI_MEAN_T,
-    KITTI_STD_T,
     triangulate_all_points,
     build_heterogeneous_graph,
     compute_reprojection_error,
     post_processing,
     recover_trajectory_and_poses,
-    rotation_to_euler,
-    euler_to_rotation,
+)
+from utils.dq import (
+    dq_mult_np,
+    dq_conj_np,
+    dq_identity_np,
+    dq_to_matrix_torch,
+    relative_poses_to_absolute_dq_torch,
+    matrix_to_dq_np,
 )
 
 
-def add_noise_to_relative_poses(rel_poses_6dof, trans_noise, rot_noise):
-    noisy = rel_poses_6dof.copy()
-    noisy[:, :3] += np.random.randn(*noisy[:, :3].shape) * rot_noise
-    noisy[:, 3:] += np.random.randn(*noisy[:, 3:].shape) * trans_noise
-    return noisy
+def add_noise_to_relative_poses(rel_poses_dq, trans_noise, rot_noise):
+    """Add noise to DQ relative poses."""
+    noisy_dq = []
+    for dq in rel_poses_dq:
+        from utils.dq import _quat_to_rotmat_torch as _q2r, dq_extract_translation_torch
+        import torch as _t
+        from scipy.spatial.transform import Rotation
+        dq_t = _t.as_tensor(dq, dtype=_t.float32).unsqueeze(0)
+        R = _q2r(dq_t[..., :4]).squeeze(0).numpy()
+        t = dq_extract_translation_torch(dq_t).squeeze(0).numpy()
+        t += np.random.randn(3) * trans_noise
+        R_noise = Rotation.from_rotvec(np.random.randn(3) * rot_noise).as_matrix()
+        R_new = R_noise @ R
+        T = np.eye(4)
+        T[:3, :3] = R_new
+        T[:3, 3] = t
+        noisy_dq.append(matrix_to_dq_np(T))
+    return np.array(noisy_dq)
 
 
-def accumulate_relative_poses(relative_poses_6dof):
-    abs_poses = [np.eye(4)]
-    for rel in relative_poses_6dof:
-        R = euler_to_rotation(rel[:3], seq="zyx")
-        T_rel = np.eye(4)
-        T_rel[:3, :3] = R
-        T_rel[:3, 3] = rel[3:]
-        abs_poses.append(abs_poses[-1] @ T_rel)
-    return abs_poses
+def accumulate_relative_poses(relative_poses_dq):
+    abs_dq = [dq_identity_np()]
+    for rel in relative_poses_dq:
+        abs_dq.append(dq_mult_np(abs_dq[-1], rel))
+    return np.array(abs_dq)
 
 
 def absolute_4x4_to_6dof(abs_poses):
@@ -58,22 +69,6 @@ def absolute_4x4_to_6dof(abs_poses):
         euler = rotation_to_euler(R, seq="zyx")
         result.append(np.concatenate([euler, t]))
     return np.array(result)
-
-
-def compute_normalized_c2c_edges(camera_feats, window_size):
-    cam_src = torch.arange(0, window_size - 1)
-    cam_dst = cam_src + 1
-    c2c_index = torch.stack([cam_src, cam_dst], dim=0)
-    ang_diff = camera_feats[1:, :3] - camera_feats[:-1, :3]
-    t_diff = camera_feats[1:, 3:6] - camera_feats[:-1, 3:6]
-    c2c_attr = torch.cat(
-        [
-            ang_diff / torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32),
-            t_diff / torch.tensor(KITTI_STD_T, dtype=torch.float32),
-        ],
-        dim=-1,
-    )
-    return c2c_index, c2c_attr
 
 
 def main():
@@ -145,19 +140,18 @@ def main():
 
         if len(tracks) < 10:
             num_failed += 1
-            opt_relative_poses_list.append(np.zeros((window_size - 1, 6)))
+            opt_relative_poses_list.append(np.zeros((window_size - 1, 8)))
             continue
 
-        # Add noise to GT relative poses
-        noisy_rel = add_noise_to_relative_poses(gt_rel, args_ns.trans_noise, args_ns.rot_noise)
-        noisy_abs = accumulate_relative_poses(noisy_rel)
-        camera_feats = absolute_4x4_to_6dof(noisy_abs)
+        # Add noise to GT relative DQ poses
+        noisy_rel_dq = add_noise_to_relative_poses(gt_rel, args_ns.trans_noise, args_ns.rot_noise)
+        noisy_abs_dq = accumulate_relative_poses(noisy_rel_dq)
 
         # Triangulate from noisy poses
-        points_3d, graph_obs, _ = triangulate_all_points(tracks, noisy_abs, K)
+        points_3d, graph_obs, _ = triangulate_all_points(tracks, noisy_abs_dq, K)
         if len(points_3d) < 10:
             num_failed += 1
-            opt_relative_poses_list.append(np.zeros((window_size - 1, 6)))
+            opt_relative_poses_list.append(np.zeros((window_size - 1, 8)))
             continue
 
         # Normalize points
@@ -171,21 +165,13 @@ def main():
         data = build_heterogeneous_graph(
             window_size, points_3d_norm, graph_obs, img_height, img_width
         )
-        data["camera"].x = torch.tensor(camera_feats, dtype=torch.float32)
-        # c2c edges: use EXACT noisy relative pose (normalized)
+        data["camera"].x = torch.tensor(noisy_abs_dq, dtype=torch.float32)
+        # c2c edges: use DQ noisy relative pose
         c2c_index = torch.stack([
             torch.arange(0, window_size - 1), torch.arange(1, window_size)
         ], dim=0)
-        noisy_rel_t = torch.tensor(noisy_rel, dtype=torch.float32)
-        noisy_rel_norm = noisy_rel_t.clone()
-        std_a_t = torch.tensor(KITTI_STD_ANGLES, dtype=torch.float32)
-        mean_a_t = torch.tensor(KITTI_MEAN_ANGLES, dtype=torch.float32)
-        std_t_t_p = torch.tensor(KITTI_STD_T, dtype=torch.float32)
-        mean_t_t_p = torch.tensor(KITTI_MEAN_T, dtype=torch.float32)
-        noisy_rel_norm[:, :3] = (noisy_rel_norm[:, :3] - mean_a_t) / std_a_t
-        noisy_rel_norm[:, 3:] = (noisy_rel_norm[:, 3:] - mean_t_t_p) / std_t_t_p
         data["camera", "temporal", "camera"].edge_index = c2c_index
-        data["camera", "temporal", "camera"].edge_attr = noisy_rel_norm
+        data["camera", "temporal", "camera"].edge_attr = torch.tensor(noisy_rel_dq, dtype=torch.float32)
         data = data.to(device)
 
         with torch.no_grad():
@@ -200,7 +186,7 @@ def main():
     print("Post-processing...")
     opt_relative_poses = np.array(opt_relative_poses_list)
     processed = post_processing(opt_relative_poses, window_size, overlap)
-    opt_poses, opt_trajectory = recover_trajectory_and_poses(processed, norm=True)
+    opt_poses, opt_trajectory = recover_trajectory_and_poses(processed, use_dq=True)
 
     print(f"  Recovered {len(opt_poses)} optimized poses")
 

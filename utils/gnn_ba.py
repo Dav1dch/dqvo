@@ -16,6 +16,30 @@ import torch
 from scipy.spatial.transform import Rotation
 from torch_geometric.data import HeteroData
 
+from utils.dq import (
+    matrix_to_dq_np,
+    dq_to_matrix_np,
+    dq_to_rt_np,
+    dq_mult_np,
+    dq_conj_np,
+    dq_inverse_np,
+    dq_mult_torch,
+    dq_conj_torch,
+    dq_inverse_torch,
+    dq_transform_point_torch,
+    dq_transform_points_batch_torch,
+    dq_normalize_torch,
+    dq_identity_np,
+    dq_identity_torch,
+    dq_extract_translation_torch,
+    dq_geodesic_loss,
+    dq_to_matrix_torch,
+    _quat_to_rotmat_torch,
+    _rotmat_to_quat_np,
+    _quat_mult_np,
+    dq_transform_point,
+)
+
 
 # KITTI normalization statistics for VO model outputs
 KITTI_MEAN_ANGLES = np.array([1.7061e-5, 9.5582e-4, -5.5258e-5])
@@ -172,74 +196,59 @@ def pose_6dof_to_matrix_torch(pose_6dof, seq='zyx'):
     return pose_matrices
 
 
-def poses_to_camera_features(poses, mean_angles, std_angles, mean_t, std_t):
+def pose_6dof_to_dq(euler_zyx, translation):
     """
-    Convert camera poses to normalized camera feature vectors.
-
-    Supports both 4x4 transformation matrices and 6-DOF vectors as input.
-    Converts rotation matrix to Euler angles, then normalizes both
-    euler angles and translation using dataset statistics.
+    Convert denormalized 6-DOF [euler_z, euler_y, euler_x, tx, ty, tz] to dual quaternion.
 
     Args:
-        poses: 4x4 transformation matrices (N, 4, 4) or 6-DOF vectors (N, 6)
-               or list of 4x4 matrices, or single 4x4 matrix (4, 4)
-        mean_angles, std_angles: normalization parameters for euler angles
-        mean_t, std_t: normalization parameters for translation
+        euler_zyx: (3,) euler angles in radians, seq='zyx'
+        translation: (3,) translation in meters
 
     Returns:
-        camera_feats: (N, 6) array of [euler_norm(3), trans_norm(3)]
+        dq: (8,) dual quaternion [qw,qx,qy,qz, q'w,q'x,q'y,q'z]
     """
-    # Handle 6-DOF input directly
+    R = euler_to_rotation(euler_zyx, seq='zyx')
+    q_r = _rotmat_to_quat_np(R)
+    if q_r.ndim == 2:
+        q_r = q_r[0]
+    t_q = np.array([0.0, translation[0], translation[1], translation[2]])
+    q_d = 0.5 * _quat_mult_np(t_q, q_r)
+    return np.concatenate([q_r, q_d])
+
+
+def poses_to_camera_features(poses):
+    """
+    Convert camera poses to DQ camera feature vectors (no normalization).
+
+    Supports 4x4 transformation matrices as input.
+    Returns absolute DQ poses for each frame.
+
+    Args:
+        poses: 4x4 transformation matrices (N, 4, 4) or list of 4x4, or DQ arrays
+
+    Returns:
+        camera_feats: (N, 8) array of DQ absolute poses
+    """
+    import numpy as np
+
     if isinstance(poses, np.ndarray):
-        if poses.ndim == 2 and poses.shape[1] == 6:
-            # Already 6-DOF format, just normalize
-            euler = poses[:, :3]
-            t = poses[:, 3:]
-            euler_norm = (euler - mean_angles) / std_angles
-            t_norm = (t - mean_t) / std_t
-            return np.concatenate([euler_norm, t_norm], axis=1)
-        elif poses.ndim == 1 and poses.shape[0] == 6:
-            # Single 6-DOF pose
-            euler = poses[:3]
-            t = poses[3:]
-            euler_norm = (euler - mean_angles) / std_angles
-            t_norm = (t - mean_t) / std_t
-            return np.concatenate([euler_norm, t_norm])
+        if poses.ndim == 2 and poses.shape[1] == 8:
+            return poses  # Already DQ
+        elif poses.ndim == 1 and poses.shape[0] == 8:
+            return poses[np.newaxis, :]
         elif poses.ndim == 2 and poses.shape == (4, 4):
             poses = [poses]
         elif poses.ndim == 3 and poses.shape[1:] == (4, 4):
             poses = list(poses)
-    elif isinstance(poses, torch.Tensor):
-        poses = poses.cpu().numpy()
-        if poses.ndim == 2 and poses.shape[1] == 6:
-            # Already 6-DOF format, just normalize
-            euler = poses[:, :3]
-            t = poses[:, 3:]
-            euler_norm = (euler - mean_angles) / std_angles
-            t_norm = (t - mean_t) / std_t
-            return np.concatenate([euler_norm, t_norm], axis=1)
-        elif poses.ndim == 1 and poses.shape[0] == 6:
-            euler = poses[:3]
-            t = poses[3:]
-            euler_norm = (euler - mean_angles) / std_angles
-            t_norm = (t - mean_t) / std_t
-            return np.concatenate([euler_norm, t_norm])
-        elif poses.ndim == 2 and poses.shape == (4, 4):
-            poses = [poses]
-        elif poses.ndim == 3 and poses.shape[1:] == (4, 4):
-            poses = list(poses)
+    elif isinstance(poses, list):
+        pass
 
     camera_feats = []
     for pose in poses:
         if isinstance(pose, torch.Tensor):
             pose = pose.cpu().numpy()
-        R = pose[:3, :3]
-        t = pose[:3, 3]
-        euler = rotation_to_euler(R, seq='zyx')
-        euler_norm = (euler - mean_angles) / std_angles
-        t_norm = (t - mean_t) / std_t
-        feat = np.concatenate([euler_norm, t_norm])
-        camera_feats.append(feat)
+        dq = matrix_to_dq_np(pose)
+        camera_feats.append(dq)
     return np.array(camera_feats)
 
 
@@ -329,61 +338,133 @@ def denormalize_poses(vo_output, window_size, mean_angles, std_angles, mean_t, s
 # Triangulation
 # =============================================================================
 
-def triangulate_dlt(points_2d, poses, K, device='cpu'):
+def _precompute_camera_proj(poses_c2w_dq, K_matrix, device):
     """
-    Triangulate a 3D point from 2D observations using Direct Linear Transform (DLT).
-    PyTorch implementation with CUDA support and differentiable.
-
-    For each observation (u, v) and camera pose P:
-        - x = K^{-1} * [u, v, 1]  (normalized coordinates)
-        - Add equations: x[0]*P[2,:] - P[0,:] = 0
-                        x[1]*P[2,:] - P[1,:] = 0
-    Solve using SVD - the solution is the last row of Vt.
-
-    Args:
-        points_2d: list of (u, v) observations
-        poses: list of 4x4 camera poses (camera to world)
-        K: camera intrinsics matrix (3x3)
-        device: torch device for computation
-
+    Pre-compute camera projection data from DQ poses.
+    
     Returns:
-        X: 4D homogeneous 3D point (X, Y, Z, W) as torch tensor
+        proj_rows_u: (M, 4) — constraint rows for u coordinate
+        proj_rows_v: (M, 4) — constraint rows for v coordinate
+        proj_rows_z: (M, 4) — R[2,:] + t[2] row
+        poses_w2c: (M, 8) — world-to-camera DQs
+        K_inv: (3, 3) — inverse intrinsics
     """
-    dtype = points_2d[0].dtype if isinstance(points_2d[0], torch.Tensor) else torch.float32
+    if isinstance(poses_c2w_dq, np.ndarray):
+        poses_c2w = torch.from_numpy(poses_c2w_dq).float().to(device)
+    elif isinstance(poses_c2w_dq, list):
+        poses_c2w = torch.tensor(np.stack(poses_c2w_dq), dtype=torch.float32, device=device)
+    else:
+        poses_c2w = poses_c2w_dq.to(device)
+    
+    M = poses_c2w.shape[0]
+    poses_w2c = dq_inverse_torch(poses_c2w)
+    q_r = poses_w2c[..., :4]
+    
+    R = _quat_to_rotmat_torch(q_r)  # (M, 3, 3)
+    t = dq_extract_translation_torch(poses_w2c)  # (M, 3)
+    
+    fx, cx = K_matrix[0, 0], K_matrix[0, 2]
+    fy, cy = K_matrix[1, 1], K_matrix[1, 2]
+    
+    proj_rows_u = torch.empty(M, 4, dtype=torch.float32, device=device)
+    proj_rows_u[:, :3] = fx * R[:, 0, :] + cx * R[:, 2, :]
+    proj_rows_u[:, 3] = fx * t[:, 0] + cx * t[:, 2]
+    
+    proj_rows_v = torch.empty(M, 4, dtype=torch.float32, device=device)
+    proj_rows_v[:, :3] = fy * R[:, 1, :] + cy * R[:, 2, :]
+    proj_rows_v[:, 3] = fy * t[:, 1] + cy * t[:, 2]
+    
+    proj_rows_z = torch.empty(M, 4, dtype=torch.float32, device=device)
+    proj_rows_z[:, :3] = R[:, 2, :]
+    proj_rows_z[:, 3] = t[:, 2]
+    
+    K_inv = torch.inverse(K_matrix)
+    
+    return proj_rows_u, proj_rows_v, proj_rows_z, poses_w2c, K_inv
+
+
+def _dq_c2w_to_w2c_rt_torch(dq, device=None):
+    """
+    Extract world-to-camera rotation and translation from camera-to-world DQ.
+    """
+    d_w2c = dq_inverse_torch(dq)
+    q_r = d_w2c[..., :4]
+    q_d = d_w2c[..., 4:]
+    R = _quat_to_rotmat_torch(q_r)
+    t = dq_extract_translation_torch(d_w2c)
+    return R, t
+
+
+def triangulate_dlt(points_2d, poses_dq, K, device='cpu'):
+    """
+    Triangulate a 3D point from 2D observations using DLT.
+    """
     A = []
-    for (u, v), pose in zip(points_2d, poses):
-        if isinstance(pose, np.ndarray):
-            pose = torch.from_numpy(pose).float().to(K.device)
-        elif pose.device != K.device:
-            pose = pose.to(K.device)
+    for (u, v), dq in zip(points_2d, poses_dq):
+        if isinstance(dq, np.ndarray):
+            dq = torch.from_numpy(dq).float().to(K.device)
+        elif dq.device != K.device:
+            dq = dq.to(K.device)
+        R_w2c, t_w2c = _dq_c2w_to_w2c_rt_torch(dq.unsqueeze(0))
+        R_w2c, t_w2c = R_w2c.squeeze(0), t_w2c.squeeze(0)
         pt = torch.tensor([u, v, 1.0], dtype=torch.float32, device=K.device)
         K_inv = torch.inverse(K)
         pt_norm = K_inv @ pt
-        P = pose
-        A.append(pt_norm[0] * P[2, :] - P[0, :])
-        A.append(pt_norm[1] * P[2, :] - P[1, :])
+        P_row0 = K[0, 0] * R_w2c[0, :] + K[0, 2] * R_w2c[2, :]
+        P_row1 = K[1, 1] * R_w2c[1, :] + K[1, 2] * R_w2c[2, :]
+        P_row2 = R_w2c[2, :]
+        p0 = K[0, 0] * t_w2c[0] + K[0, 2] * t_w2c[2]
+        p1 = K[1, 1] * t_w2c[1] + K[1, 2] * t_w2c[2]
+        p2 = t_w2c[2]
+        row0 = torch.empty(4, dtype=torch.float32, device=K.device)
+        row0[:3] = P_row0; row0[3] = p0
+        row1 = torch.empty(4, dtype=torch.float32, device=K.device)
+        row1[:3] = P_row1; row1[3] = p1
+        row2 = torch.empty(4, dtype=torch.float32, device=K.device)
+        row2[:3] = P_row2; row2[3] = p2
+        A.append(pt_norm[0] * row2 - row0)
+        A.append(pt_norm[1] * row2 - row1)
     A = torch.stack(A)
-    _, _, Vt = torch.svd(A)
+    _, _, Vt = torch.linalg.svd(A)
     X = Vt[-1]
     return X / X[3]
 
 
-def triangulate_tracks_no_filter(tracks, track_indices, poses_c2w, K, device='cpu'):
+def _triangulate_track_gpu(frame_indices, pts_2d, proj_rows_u, proj_rows_v, proj_rows_z, K_inv):
     """
-    Triangulate 3D points for specific tracks WITHOUT cheirality filtering.
-
-    Guarantees one output point per input track index, so point counts always match.
-    Used for GT triangulation where we need the same number of points as VO triangulation.
-
+    GPU-optimised DLT for a single track using pre-computed camera projection data.
+    
     Args:
-        tracks: full list of tracks
-        track_indices: indices of tracks to triangulate (from VO triangulation valid_tracks)
-        poses_c2w: List of 4x4 camera poses (camera to world)
-        K: camera intrinsics dict
-        device: torch device
-
+        frame_indices: (K,) int tensor of camera indices
+        pts_2d: (K, 2) float tensor of (u, v) pixel coordinates
+        proj_rows_*: (M, 4) pre-computed projection rows K@[R|t] for all cameras
     Returns:
-        points_3d: (N, 3) tensor with exactly len(track_indices) points
+        X_3d: (3,) triangulated 3D point
+    """
+    K = frame_indices.shape[0]
+    
+    # Index pre-computed projection rows
+    p_u = proj_rows_u[frame_indices]  # (K, 4) — K@[R|t] row 0
+    p_v = proj_rows_v[frame_indices]  # (K, 4) — K@[R|t] row 1
+    p_z = proj_rows_z[frame_indices]  # (K, 4) — K@[R|t] row 2 = [R[2], t[2]]
+    
+    # Build A matrix: (2*K, 4)
+    # Constraint: u * P_z - P_u = 0,  v * P_z - P_v = 0
+    A = torch.empty(2 * K, 4, dtype=pts_2d.dtype, device=pts_2d.device)
+    A[0::2] = pts_2d[:, 0:1] * p_z - p_u
+    A[1::2] = pts_2d[:, 1:2] * p_z - p_v
+    
+    _, _, Vt = torch.linalg.svd(A)
+    X = Vt[-1]
+    return X[:3] / X[3]
+
+
+def triangulate_all_points(tracks, poses_c2w_dq, K, min_depth=0.1, device='cpu'):
+    """
+    GPU-optimised triangulation of all 3D points from tracks.
+    
+    Pre-computes camera projection data once, then runs per-track DLT
+    with GPU tensor indexing and batched cheirality checks.
     """
     if isinstance(K['fx'], torch.Tensor):
         K_matrix = torch.tensor([[K['fx'].item(), 0, K['cx'].item()],
@@ -394,30 +475,100 @@ def triangulate_tracks_no_filter(tracks, track_indices, poses_c2w, K, device='cp
                                   [0, K['fy'], K['cy']],
                                   [0, 0, 1]], dtype=torch.float32, device=device)
 
-    poses_w2c = []
-    for pose in poses_c2w:
-        if isinstance(pose, np.ndarray):
-            poses_w2c.append(np.linalg.inv(pose))
+    proj_rows_u, proj_rows_v, proj_rows_z, poses_w2c, K_inv = \
+        _precompute_camera_proj(poses_c2w_dq, K_matrix, device)
+    
+    M = poses_w2c.shape[0]
+    points_3d = []
+    observations = []
+    valid_track_indices = []
+    
+    # Pre-convert all track data to GPU tensors for fast processing
+    for track_idx, track in enumerate(tracks):
+        if len(track) < 2:
+            continue
+        
+        if len(track[0]) == 4:
+            frame_idx_list = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
+            u_list = [t[2].item() if hasattr(t[2], 'item') else t[2] for t in track]
+            v_list = [t[3].item() if hasattr(t[3], 'item') else t[3] for t in track]
         else:
-            poses_w2c.append(torch.inverse(pose))
+            frame_idx_list = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
+            u_list = [t[1].item() if hasattr(t[1], 'item') else t[1] for t in track]
+            v_list = [t[2].item() if hasattr(t[2], 'item') else t[2] for t in track]
+        
+        frame_indices = torch.tensor(frame_idx_list, dtype=torch.long, device=device)
+        pts_2d = torch.tensor([[u, v] for u, v in zip(u_list, v_list)], dtype=torch.float32, device=device)
+        
+        try:
+            X_3d = _triangulate_track_gpu(frame_indices, pts_2d, proj_rows_u, proj_rows_v, proj_rows_z, K_inv)
+        except Exception:
+            continue
+        
+        # Batch cheirality check: transform point through all relevant cameras at once
+        dqs_cam = poses_w2c[frame_indices]  # (K, 8)
+        X_expanded = X_3d.unsqueeze(0).expand(frame_indices.shape[0], -1)  # (K, 3)
+        X_cam = dq_transform_point_torch(dqs_cam, X_expanded)  # (K, 3) — uses broadcasting
+        depths = X_cam[:, 2]
+        if (depths < min_depth).any():
+            continue
+        
+        if X_3d[2] <= 0:
+            continue
+        
+        points_3d.append(X_3d)
+        for t in track:
+            if len(t) == 4:
+                fi = t[0].item() if hasattr(t[0], 'item') else t[0]
+                u = t[2].item() if hasattr(t[2], 'item') else t[2]
+                v = t[3].item() if hasattr(t[3], 'item') else t[3]
+            else:
+                fi = t[0].item() if hasattr(t[0], 'item') else t[0]
+                u = t[1].item() if hasattr(t[1], 'item') else t[1]
+                v = t[2].item() if hasattr(t[2], 'item') else t[2]
+            observations.append((len(points_3d) - 1, fi, u, v))
+        valid_track_indices.append(track_idx)
+    
+    if points_3d:
+        return torch.stack(points_3d), observations, valid_track_indices
+    else:
+        return torch.zeros(0, 3, device=device, dtype=torch.float32), observations, []
+
+
+def triangulate_tracks_no_filter(tracks, track_indices, poses_c2w_dq, K, device='cpu'):
+    """
+    GPU-optimised triangulation for specific tracks WITHOUT cheirality filtering.
+    Uses pre-computed camera projection data.
+    """
+    if isinstance(K['fx'], torch.Tensor):
+        K_matrix = torch.tensor([[K['fx'].item(), 0, K['cx'].item()],
+                                  [0, K['fy'].item(), K['cy'].item()],
+                                  [0, 0, 1]], dtype=torch.float32, device=device)
+    else:
+        K_matrix = torch.tensor([[K['fx'], 0, K['cx']],
+                                  [0, K['fy'], K['cy']],
+                                  [0, 0, 1]], dtype=torch.float32, device=device)
+
+    proj_rows_u, proj_rows_v, proj_rows_z, _, K_inv = \
+        _precompute_camera_proj(poses_c2w_dq, K_matrix, device)
 
     points_3d = []
     for track_idx in track_indices:
         track = tracks[track_idx]
         if len(track[0]) == 4:
-            pts_2d = [(t[2].item() if hasattr(t[2], 'item') else t[2],
-                       t[3].item() if hasattr(t[3], 'item') else t[3]) for t in track]
-            frame_indices = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
+            fi = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
+            u_list = [t[2].item() if hasattr(t[2], 'item') else t[2] for t in track]
+            v_list = [t[3].item() if hasattr(t[3], 'item') else t[3] for t in track]
         else:
-            pts_2d = [(t[1].item() if hasattr(t[1], 'item') else t[1],
-                       t[2].item() if hasattr(t[2], 'item') else t[2]) for t in track]
-            frame_indices = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
+            fi = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
+            u_list = [t[1].item() if hasattr(t[1], 'item') else t[1] for t in track]
+            v_list = [t[2].item() if hasattr(t[2], 'item') else t[2] for t in track]
 
-        track_poses = [poses_w2c[i] for i in frame_indices]
+        frame_indices = torch.tensor(fi, dtype=torch.long, device=device)
+        pts_2d = torch.tensor([[u, v] for u, v in zip(u_list, v_list)], dtype=torch.float32, device=device)
 
         try:
-            X = triangulate_dlt(pts_2d, track_poses, K_matrix, device=device)
-            X_3d = X[:3] / X[3]
+            X_3d = _triangulate_track_gpu(frame_indices, pts_2d, proj_rows_u, proj_rows_v, proj_rows_z, K_inv)
             points_3d.append(X_3d)
         except Exception:
             points_3d.append(torch.zeros(3, dtype=torch.float32, device=device))
@@ -425,114 +576,14 @@ def triangulate_tracks_no_filter(tracks, track_indices, poses_c2w, K, device='cp
     return torch.stack(points_3d)
 
 
-def triangulate_all_points(tracks, poses_c2w, K, min_depth=0.1, device='cpu'):
-    """
-    Triangulate all 3D points from tracks.
-    PyTorch implementation with CUDA support and differentiable.
-
-    For each track (series of 2D observations across frames):
-    1. Extract 2D points and corresponding camera poses
-    2. Run DLT triangulation
-    3. Validate: all camera depths must be positive (Cheirality check)
-
-    Args:
-        tracks: List of tracks, each track is [(frame_idx, u, v), ...] or [(frame_idx, kp_idx, u, v), ...]
-        poses_c2w: List of 4x4 camera poses (camera to world) as torch tensors or numpy arrays
-        K: camera intrinsics dict with fx, fy, cx, cy
-        min_depth: minimum valid depth (default 0.1m)
-        device: torch device for computation
-
-    Returns:
-        points_3d: (N, 3) torch tensor of triangulated 3D points
-        observations: list of [point_idx, frame_idx, u, v] for graph edges
-        valid_track_indices: list of original track indices that passed triangulation
-    """
-    if isinstance(K['fx'], torch.Tensor):
-        K_matrix = torch.tensor([[K['fx'].item(), 0, K['cx'].item()], 
-                                  [0, K['fy'].item(), K['cy'].item()], 
-                                  [0, 0, 1]], dtype=torch.float32, device=device)
-    else:
-        K_matrix = torch.tensor([[K['fx'], 0, K['cx']], 
-                                  [0, K['fy'], K['cy']], 
-                                  [0, 0, 1]], dtype=torch.float32, device=device)
-
-    # Convert c2w poses to w2c for triangulation and depth checks
-    poses_w2c = []
-    for pose in poses_c2w:
-        if isinstance(pose, np.ndarray):
-            poses_w2c.append(np.linalg.inv(pose))
-        else:
-            # torch.Tensor
-            poses_w2c.append(torch.inverse(pose))
-    points_3d = []
-    observations = []
-    valid_track_indices = []
-
-    for track_idx, track in enumerate(tracks):
-        if len(track) < 2:
-            continue
-
-        if len(track[0]) == 4:
-            pts_2d = [(t[2].item() if hasattr(t[2], 'item') else t[2],
-                       t[3].item() if hasattr(t[3], 'item') else t[3]) for t in track]
-            frame_indices = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
-        else:
-            pts_2d = [(t[1].item() if hasattr(t[1], 'item') else t[1],
-                       t[2].item() if hasattr(t[2], 'item') else t[2]) for t in track]
-            frame_indices = [t[0].item() if hasattr(t[0], 'item') else t[0] for t in track]
-
-        track_poses = [poses_w2c[i] for i in frame_indices]
-
-        try:
-            X = triangulate_dlt(pts_2d, track_poses, K_matrix, device=device)
-        except Exception:
-            continue
-
-        X_3d = X[:3] / X[3]
-
-        valid = True
-        for pose in track_poses:
-            if isinstance(pose, np.ndarray):
-                pose = torch.from_numpy(pose).float().to(device)
-            elif pose.device != device:
-                pose = pose.to(device)
-            cam_coords = pose @ X
-            if cam_coords[2] < min_depth:
-                valid = False
-                break
-
-        if valid and X_3d[2] > 0:
-            points_3d.append(X_3d)
-            for t in track:
-                if len(t) == 4:
-                    frame_idx = t[0].item() if hasattr(t[0], 'item') else t[0]
-                    u = t[2].item() if hasattr(t[2], 'item') else t[2]
-                    v = t[3].item() if hasattr(t[3], 'item') else t[3]
-                else:
-                    frame_idx = t[0].item() if hasattr(t[0], 'item') else t[0]
-                    u = t[1].item() if hasattr(t[1], 'item') else t[1]
-                    v = t[2].item() if hasattr(t[2], 'item') else t[2]
-                observations.append((len(points_3d) - 1, frame_idx, u, v))
-            valid_track_indices.append(track_idx)
-
-    if points_3d:
-        return torch.stack(points_3d), observations, valid_track_indices
-    else:
-        return torch.zeros(0, 3, device=device, dtype=torch.float32), observations, []
-
-
-def triangulate_from_graph_obs(edge_index, edge_attr, poses_c2w, K, device='cpu', min_depth=0.1):
+def triangulate_from_graph_obs(edge_index, edge_attr, poses_c2w_dq, K, device='cpu', min_depth=0.1):
     """
     Differentiable batched triangulation from GNN-predicted poses using graph observations.
-
-    Re-triangulates 3D points from camera poses and observation edges.
-    Used during training to compute reprojection loss with GNN-predicted poses.
-    Fully differentiable - no .item() calls that break the computation graph.
 
     Args:
         edge_index: (2, M) tensor [cam_indices, point_indices] from ('camera', 'observes', 'point')
         edge_attr: (M, 2) tensor [u_norm, v_norm] normalized pixel coordinates
-        poses_c2w: (N_cam, 4, 4) tensor of camera-to-world poses
+        poses_c2w_dq: (N_cam, 8) tensor of camera-to-world DQ poses
         K: camera intrinsics dict with fx, fy, cx, cy
         device: torch device
         min_depth: minimum valid depth for cheirality check
@@ -578,13 +629,20 @@ def triangulate_from_graph_obs(edge_index, edge_attr, poses_c2w, K, device='cpu'
         for j in range(n_obs):
             u, v = u_obs[j], v_obs[j]
             ci = cam_idx[j]
-            P = poses_c2w[ci]
+            dq = poses_c2w_dq[ci]
+            R_w2c, t_w2c = _dq_c2w_to_w2c_rt_torch(dq.unsqueeze(0))
+            R_w2c, t_w2c = R_w2c.squeeze(0), t_w2c.squeeze(0)
 
-            pt = torch.stack([u, v, torch.tensor(1.0, device=device)])
-            pt_norm = K_inv @ pt
+            P_row0 = fx * R_w2c[0, :] + cx * R_w2c[2, :]
+            P_row1 = fy * R_w2c[1, :] + cy * R_w2c[2, :]
+            P_row2 = R_w2c[2, :]
+            p0 = fx * t_w2c[0] + cx * t_w2c[2]
+            p1 = fy * t_w2c[1] + cy * t_w2c[2]
+            p2 = t_w2c[2]
 
-            A_rows.append(pt_norm[0] * P[2, :] - P[0, :])
-            A_rows.append(pt_norm[1] * P[2, :] - P[1, :])
+            # Build 4-vector rows: u * P_z - P_u = 0, v * P_z - P_v = 0
+            A_rows.append(u * torch.cat([P_row2, p2.unsqueeze(0)]) - torch.cat([P_row0, p0.unsqueeze(0)]))
+            A_rows.append(v * torch.cat([P_row2, p2.unsqueeze(0)]) - torch.cat([P_row1, p1.unsqueeze(0)]))
 
         if len(A_rows) < 4:
             continue
@@ -630,7 +688,7 @@ def build_heterogeneous_graph(num_cameras, points_3d, observations, img_height, 
     data = HeteroData()
 
     # Initialize node features with zeros (will be set by caller)
-    data['camera'].x = torch.zeros(num_cameras, 6)  # 6 = euler(3) + trans(3)
+    data['camera'].x = torch.zeros(num_cameras, 8)  # 8 = dual quaternion
     data['point'].x = points_3d.clone().detach() if isinstance(points_3d, torch.Tensor) else torch.tensor(points_3d, dtype=torch.float32)
 
     # Build edges: which camera observes which point
@@ -657,13 +715,14 @@ def build_heterogeneous_graph(num_cameras, points_3d, observations, img_height, 
 # Projection and Losses
 # =============================================================================
 
-def project_points_torch(points_3d, poses_c2w, K, device):
+def project_points_torch(points_3d, poses_c2w_dq, K, device):
     """
-    Project 3D points to 2D pixel coordinates using camera poses (camera-to-world) and intrinsics.
+    Project 3D points to 2D pixel coordinates using DQ camera poses and intrinsics.
+    Fully batched over both cameras and points.
 
     Args:
         points_3d: (N, 3) tensor of 3D points in world frame
-        poses_c2w: (M, 4, 4) tensor of camera poses (camera to world)
+        poses_c2w_dq: (M, 8) tensor of camera-to-world DQ poses
         K: intrinsics dict with fx, fy, cx, cy
         device: torch device
 
@@ -671,7 +730,7 @@ def project_points_torch(points_3d, poses_c2w, K, device):
         proj_2d: (M, N, 2) tensor of projected pixel coordinates for each camera
     """
     N = points_3d.shape[0]
-    M = poses_c2w.shape[0]
+    M = poses_c2w_dq.shape[0]
 
     if isinstance(K['fx'], torch.Tensor):
         fx, fy, cx, cy = K['fx'].item(), K['fy'].item(), K['cx'].item(), K['cy'].item()
@@ -679,24 +738,33 @@ def project_points_torch(points_3d, poses_c2w, K, device):
         fx, fy, cx, cy = K['fx'], K['fy'], K['cx'], K['cy']
     K_matrix = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=torch.float32, device=device)
 
-    # Convert points to homogeneous coordinates
-    points_h = torch.cat([points_3d, torch.ones(N, 1, device=device)], dim=1)
+    poses_w2c_dq = dq_inverse_torch(poses_c2w_dq)  # (M, 8)
+    X_cam = dq_transform_points_batch_torch(poses_w2c_dq, points_3d)  # (M, N, 3)
 
-    # Invert poses to get world-to-camera
-    poses_w2c = torch.inverse(poses_c2w)
+    depths = X_cam[..., 2].clamp(min=0.1)  # (M, N)
+    proj_h = torch.einsum('ij,mnj->mni', K_matrix, X_cam)  # (M, N, 3)
+    proj_2d = proj_h[..., :2] / depths.unsqueeze(-1)  # (M, N, 2)
 
-    # Transform points to camera frame: X_cam = P_w2c * X_world
-    points_cam = torch.matmul(poses_w2c[:, :3, :], points_h.T)
+    return proj_2d
 
-    # Clamp depths to avoid division by zero
-    depths = points_cam[:, 2, :].unsqueeze(1).clamp(min=0.1)
 
-    # Project to pixel coordinates
-    proj_h = torch.matmul(K_matrix, points_cam)
-    proj_2d = proj_h[:, :2, :] / depths  # Divide by depth
+def get_obs_depths_batch(abs_dq_c2w, points_3d, cam_indices, pt_indices):
+    """
+    Compute depths for observation edges in a fully batched way.
 
-    # Return shape: (M, N, 2) = (num_cameras, num_points, 2)
-    return proj_2d.permute(0, 2, 1)
+    Args:
+        abs_dq_c2w: (M, 8) absolute camera-to-world DQ poses
+        points_3d: (N, 3) 3D points
+        cam_indices: (E,) camera indices per observation
+        pt_indices: (E,) point indices per observation
+
+    Returns:
+        obs_depths: (E,) tensor of depths at each observation
+    """
+    dqs_w2c = dq_inverse_torch(abs_dq_c2w)  # (M, 8)
+    X_cam_all = dq_transform_points_batch_torch(dqs_w2c, points_3d)  # (M, N, 3)
+    obs_depths = X_cam_all[cam_indices, pt_indices, 2]  # (E,)
+    return obs_depths
 
 
 def huber_loss(errors, delta=1.0):
@@ -717,14 +785,31 @@ def huber_loss(errors, delta=1.0):
     quadratic = torch.clamp(abs_errors, max=delta)
     linear = abs_errors - quadratic
     return 0.5 * quadratic**2 + delta * linear
+    """
+    Huber loss (smooth L1 loss) - less sensitive to outliers than L2.
+
+    For |error| <= delta: 0.5 * error^2
+    For |error| > delta: delta * |error| - 0.5 * delta^2
+
+    Args:
+        errors: tensor of reprojection errors
+        delta: threshold separating L2 and L1 regions
+
+    Returns:
+        tensor of Huber losses
+    """
+    abs_errors = torch.abs(errors)
+    quadratic = torch.clamp(abs_errors, max=delta)
+    linear = abs_errors - quadratic
+    return 0.5 * quadratic**2 + delta * linear
 
 
-def compute_reprojection_error(poses_c2w, points_3d, observations, K, img_height, img_width):
+def compute_reprojection_error(poses_c2w_dq, points_3d, observations, K, img_height, img_width):
     """
     Compute RMS reprojection error in normalized coordinates [0,1].
 
     Args:
-        poses_c2w: list or array of 4x4 camera poses (camera to world)
+        poses_c2w_dq: list or array of (8,) DQ camera poses (camera to world)
         points_3d: (N, 3) array of 3D points
         observations: (M, 4) array of [point_idx, frame_idx, u_obs, v_obs]
         K: camera intrinsics dict
@@ -739,29 +824,26 @@ def compute_reprojection_error(poses_c2w, points_3d, observations, K, img_height
     else:
         K_matrix = np.array([[K['fx'], 0, K['cx']], [0, K['fy'], K['cy']], [0, 0, 1]])
 
-    # Convert c2w poses to w2c
-    poses_w2c = []
-    for pose in poses_c2w:
-        if isinstance(pose, np.ndarray):
-            poses_w2c.append(np.linalg.inv(pose))
+    # Convert c2w DQ to w2c
+    poses_w2c_dq = []
+    for dq in poses_c2w_dq:
+        if isinstance(dq, torch.Tensor):
+            dq = dq.cpu().numpy()
+        if dq.size < 8 or np.any(np.isnan(dq)):
+            poses_w2c_dq.append(dq_identity_np())  # placeholder
         else:
-            poses_w2c.append(torch.inverse(pose).cpu().numpy())
+            poses_w2c_dq.append(dq_inverse_np(dq))
 
     for point_idx, frame_idx, u_obs, v_obs in observations:
         if point_idx >= len(points_3d):
             continue
-        point_3d = points_3d[point_idx:point_idx+1]
-        point_h = np.hstack([point_3d, np.ones((1, 1))])
-        pose_w2c = poses_w2c[frame_idx]
-        if isinstance(pose_w2c, np.ndarray):
-            cam_coords = pose_w2c @ point_h.T
-        else:
-            cam_coords = pose_w2c.cpu().numpy() @ point_h.T
-        if cam_coords[2] < 0.1:
+        point_3d = points_3d[point_idx]
+        d_w2c = poses_w2c_dq[frame_idx]
+        X_cam_np = dq_transform_point(d_w2c, point_3d)
+        if X_cam_np[2] < 0.1:
             continue
-        # Project: K * cam_coords -> pixel coordinates
-        proj = K_matrix @ cam_coords[:3]
-        proj = (proj[:2] / proj[2]).flatten()
+        proj = K_matrix @ np.array([X_cam_np[0], X_cam_np[1], X_cam_np[2], 1.0])[:3]
+        proj = (proj[:2] / proj[2])
         error = np.sqrt((proj[0] - u_obs)**2 + (proj[1] - v_obs)**2)
         errors.append(error)
 
@@ -774,23 +856,28 @@ def compute_reprojection_error(poses_c2w, points_3d, observations, K, img_height
 
 def post_processing(pred_poses, window_size, overlap):
     """
-    Post-process predicted poses by averaging overlapping windows.
+    Post-process predicted relative poses by averaging overlapping windows.
 
     Args:
-        pred_poses: numpy array of shape (num_windows, window_size-1, 6)
+        pred_poses: numpy array of shape (num_windows, window_size-1, D) where D is feature dim (6 or 8)
         window_size: size of each window
         overlap: number of overlapping frames between consecutive windows
 
     Returns:
-        numpy array of processed poses
+        numpy array of processed poses shape (N, D)
     """
     if window_size == 2:
         pred_poses = pred_poses.squeeze(1)
         return np.asarray(pred_poses)
 
-    num_batchs = pred_poses.shape[0]
+    is_dq = pred_poses.shape[-1] == 8
 
-    # get poses in overlaped frames
+    def _avg(pose_list):
+        if is_dq:
+            return _dq_average_np(list(pose_list))
+        return sum(pose_list) / len(pose_list)
+
+    num_batchs = pred_poses.shape[0]
     q = queue.Queue(window_size - 1)
     idx = 0
     poses = []
@@ -800,60 +887,41 @@ def post_processing(pred_poses, window_size, overlap):
         idx = idx + 1
 
     while idx < num_batchs:
-        # process first full queue
         if idx == (window_size - 1):
             poses.append(q.queue[0][0, :])
-
-            # implemented for specific case window_size = 3 and overlap = 2
-            avg_pose = (q.queue[0][1, :] + q.queue[1][0, :]) / 2
-            poses.append(avg_pose)
-
+            poses.append(_avg([q.queue[0][1, :], q.queue[1][0, :]]))
             if window_size == 4:
-                # implemented for specific case window_size = 4 and overlap = 3
-                avg_pose = (q.queue[0][2, :] + q.queue[1][1, :] + q.queue[2][0, :]) / 3
-                poses.append(avg_pose)
-
+                poses.append(_avg([q.queue[0][2, :], q.queue[1][1, :], q.queue[2][0, :]]))
         elif idx < (num_batchs - 1):
             if window_size == 3:
-                # implemented for specific case window_size = 3 and overlap = 2
-                avg_pose = (q.queue[0][1, :] + q.queue[1][0, :]) / 2
-                poses.append(avg_pose)
-
+                poses.append(_avg([q.queue[0][1, :], q.queue[1][0, :]]))
             elif window_size == 4:
-                # implemented for specific case window_size = 4 and overlap = 3
-                avg_pose = (q.queue[0][2, :] + q.queue[1][1, :] + q.queue[2][0, :]) / 3
-                poses.append(avg_pose)
-
-        # process last full queue (idx == num_batchs-1)
+                poses.append(_avg([q.queue[0][2, :], q.queue[1][1, :], q.queue[2][0, :]]))
         else:
             if window_size == 3:
-                # implemented for specific case window_size = 3 and overlap = 2
                 poses.append(q.queue[1][1, :])
-
             elif window_size == 4:
-                # implemented for specific case window_size = 4 and overlap = 2
-                avg_pose = (q.queue[1][2, :] + q.queue[2][1, :]) / 2
-                poses.append(avg_pose)
+                poses.append(_avg([q.queue[1][2, :], q.queue[2][1, :]]))
                 poses.append(q.queue[2][2, :])
-
             idx = idx + 1
 
-        # update queue
         if idx < (num_batchs - 1):
             idx = idx + 1
-            first = q.get()  # dequeue first element
+            first = q.get()
             q.put(pred_poses[idx, :, :])
 
     return np.asarray(poses)
 
 
-def recover_trajectory_and_poses(poses, norm=True):
+def recover_trajectory_and_poses(poses, use_dq=False, norm=True):
     """
     Recover absolute trajectory from relative poses.
 
     Args:
-        poses: array of shape (N, 6) with [euler_angles, translation]
-        norm: whether to undo normalization
+        poses: array of shape (N, D)
+               D=6: [euler_angles(3), translation(3)] (legacy 6-DOF mode)
+               D=8: dual quaternion [qw,qx,qy,qz, q'w,q'x,q'y,q'z] (DQ mode, use_dq=True)
+        use_dq: if True, poses are DQ format and trajectory is composed via DQ multiplication
 
     Returns:
         predicted_poses: list of 4x4 transformation matrices
@@ -862,14 +930,24 @@ def recover_trajectory_and_poses(poses, norm=True):
     predicted_poses = []
     predicted_trajectory = []
 
-    # Undo normalization
+    if use_dq:
+        d_abs = dq_identity_np()
+        for i in range(len(poses)):
+            d_rel = _dq_normalize_np(poses[i])  # normalize before composing
+            d_abs = dq_mult_np(d_abs, d_rel)
+            d_abs = _dq_normalize_np(d_abs)
+            T = dq_to_matrix_np(d_abs)
+            predicted_poses.append(T)
+            predicted_trajectory.append(T[:3, 3])
+        return predicted_poses, predicted_trajectory
+
+    # Legacy 6-DOF mode
     mean_angles = KITTI_MEAN_ANGLES
     std_angles = KITTI_STD_ANGLES
     mean_t = KITTI_MEAN_T
     std_t = KITTI_STD_T
 
-    T = np.eye(4)  # Initialize T at the start
-
+    T = np.eye(4)
     for i in range(len(poses)):
         angles = poses[i, :3]
         t = poses[i, 3:]
@@ -881,12 +959,9 @@ def recover_trajectory_and_poses(poses, norm=True):
             euler = angles
 
         R = np.asarray(euler_to_rotation(euler, seq="zyx"))
-
         T_r = np.concatenate(
-            (
-                np.concatenate([R, np.reshape(t, (3, 1))], axis=1),
-                [[0.0, 0.0, 0.0, 1.0]],
-            ),
+            (np.concatenate([R, np.reshape(t, (3, 1))], axis=1),
+             [[0.0, 0.0, 0.0, 1.0]]),
             axis=0,
         )
         T_abs = np.dot(T, T_r)
@@ -896,3 +971,64 @@ def recover_trajectory_and_poses(poses, norm=True):
         predicted_trajectory.append(T_abs[:3, 3])
 
     return predicted_poses, predicted_trajectory
+
+
+def _dq_normalize_np(d):
+    """Numpy version of DQ normalization: unit quaternion + orthogonal dual."""
+    q_r = d[:4]
+    q_d = d[4:]
+    q_norm = np.linalg.norm(q_r)
+    if q_norm < 1e-10:
+        return np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    q_r_norm = q_r / q_norm
+    dot = np.dot(q_d, q_r_norm)
+    q_d_orth = q_d - dot * q_r_norm
+    return np.concatenate([q_r_norm, q_d_orth])
+
+
+def _dq_average_np(dq_list):
+    """
+    Average multiple DQs properly on the SE(3) manifold.
+    Extracts R,t from each, averages in log-space, re-encodes.
+    """
+    if len(dq_list) == 1:
+        return dq_list[0]
+    
+    # Filter out NaN entries
+    valid = [dq for dq in dq_list if not np.any(np.isnan(dq))]
+    if len(valid) == 0:
+        return np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    if len(valid) == 1:
+        return valid[0]
+    
+    # Extract R and t from each valid DQ
+    Rs, ts = [], []
+    for dq in valid:
+        dq_n = _dq_normalize_np(dq)
+        R, t = dq_to_rt_np(dq_n)
+        Rs.append(R)
+        ts.append(t)
+    
+    # Average rotation: use scipy's Rotation.mean() on rotation vectors
+    from scipy.spatial.transform import Rotation
+    rots = Rotation.from_matrix(Rs)
+    mean_rot = rots.mean()
+    R_avg = mean_rot.as_matrix()
+    
+    # Average translation: simple mean
+    t_avg = np.mean(ts, axis=0)
+    
+    # Build DQ from averaged R,t
+    q_r = _rotmat_to_quat_np(R_avg)
+    if q_r.ndim == 2:
+        q_r = q_r[0]
+    t_q = np.array([0.0, t_avg[0], t_avg[1], t_avg[2]])
+    q_d = 0.5 * _quat_mult_np(t_q, q_r)
+    return np.concatenate([q_r, q_d])
+    """Numpy version of DQ normalization: unit quaternion + orthogonal dual."""
+    q_r = d[:4]
+    q_d = d[4:]
+    q_r_norm = q_r / (np.linalg.norm(q_r) + 1e-10)
+    dot = np.dot(q_d, q_r_norm)
+    q_d_orth = q_d - dot * q_r_norm
+    return np.concatenate([q_r_norm, q_d_orth])
