@@ -1417,6 +1417,16 @@ def main():
                 print(f"Saved best model with error: {best_val_error:.2f}px")
 
     print("\nTraining completed!")
+    torch.save(
+        {
+            "epoch": args.num_epochs,
+            "model_state_dict": gnn_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_val_error": best_val_error,
+        },
+        os.path.join(args.save_dir, "gnn_ba_final.pth"),
+    )
+    print(f"Saved final model to {os.path.join(args.save_dir, 'gnn_ba_final.pth')}")
 
     # ---- Evaluate on test sequences ----
     test_seq_list = None
